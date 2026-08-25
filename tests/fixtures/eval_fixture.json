@@ -1,0 +1,27 @@
+[
+  {
+    "query": "What is Retrieval-Augmented Generation?",
+    "relevant_chunk_ids": ["abc123def456", "fedcba654321"],
+    "source_doc": "rag_overview.pdf"
+  },
+  {
+    "query": "How does BM25 keyword matching work?",
+    "relevant_chunk_ids": ["bm25chunk0001"],
+    "source_doc": "ir_textbook.pdf"
+  },
+  {
+    "query": "What is Reciprocal Rank Fusion?",
+    "relevant_chunk_ids": ["rrf001", "rrf002"],
+    "source_doc": "hybrid_retrieval.pdf"
+  },
+  {
+    "query": "Explain cosine similarity for embeddings.",
+    "relevant_chunk_ids": ["cosine_chunk_A"],
+    "source_doc": "embeddings_intro.pdf"
+  },
+  {
+    "query": "What metrics evaluate retrieval quality?",
+    "relevant_chunk_ids": ["metrics001", "metrics002", "metrics003"],
+    "source_doc": "eval_guide.pdf"
+  }
+]
