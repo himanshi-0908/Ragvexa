@@ -1,9 +1,21 @@
 import os
+import streamlit as st
 from dotenv import load_dotenv
 
 load_dotenv()
 
-NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
+NVIDIA_API_KEY = None
+try:
+    NVIDIA_API_KEY = st.secrets.get("NVIDIA_API_KEY")
+except Exception:
+    pass
+
+if not NVIDIA_API_KEY:
+    NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
+
+if NVIDIA_API_KEY:
+    NVIDIA_API_KEY = NVIDIA_API_KEY.strip(' "\'\n\r')
+
 CHROMA_DB_DIR = "./chroma_db"
 
 # --- Auth secrets (must come from .env, never hardcode these) ---
