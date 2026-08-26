@@ -3,15 +3,14 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-NVIDIA_API_KEY = st.secrets["NVIDIA_API_KEY"]
+NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
 CHROMA_DB_DIR = "./chroma_db"
 
-# --- Auth secrets (must come from .env, never hardcode these) ---
-COOKIE_NAME = st.secrets.get("COOKIE_NAME", "ragvexa_auth")
-COOKIE_SECRET = st.secrets["COOKIE_SECRET"]
-JWT_SECRET = st.secrets["JWT_SECRET"]
+COOKIE_NAME = os.getenv("COOKIE_NAME", "ragvexa_auth")
+COOKIE_SECRET = os.getenv("COOKIE_SECRET")
+JWT_SECRET = os.getenv("JWT_SECRET")
 JWT_ALGORITHM = "HS256"
-JWT_EXPIRE_MINUTES = int(st.secrets.get("JWT_EXPIRE_MINUTES", "1440"))
+JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "1440"))
 
 if not COOKIE_SECRET:
     raise ValueError(
