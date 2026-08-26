@@ -15,6 +15,13 @@ if not NVIDIA_API_KEY:
 
 if NVIDIA_API_KEY:
     NVIDIA_API_KEY = NVIDIA_API_KEY.strip(' "\'\n\r')
+    os.environ["NVIDIA_API_KEY"] = NVIDIA_API_KEY
+
+    # Guard against accidental placeholder copy-paste
+    if "YOUR" in NVIDIA_API_KEY or "HERE" in NVIDIA_API_KEY:
+        raise ValueError("It looks like you pasted the placeholder 'nvapi-YOUR-API-KEY-HERE' into Streamlit Cloud. Please replace it with your ACTUAL API key!")
+    if not NVIDIA_API_KEY.startswith("nvapi-"):
+        raise ValueError(f"NVIDIA API keys must start with 'nvapi-'. Your key starts with: {NVIDIA_API_KEY[:6]}...")
 
 CHROMA_DB_DIR = "./chroma_db"
 
