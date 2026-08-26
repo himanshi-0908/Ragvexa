@@ -41,6 +41,29 @@ st.set_page_config(
 )
 
 # ─────────────────────────────────────────────────────────────────
+# SEO Meta Tags
+# ─────────────────────────────────────────────────────────────────
+st.markdown("""
+    <!-- Basic SEO -->
+    <meta name="description" content="Ragvexa is the ultimate RAG (Retrieval-Augmented Generation) Engineering & Evaluation Platform. Build, test, and benchmark advanced AI retrieval pipelines with real metrics.">
+    <meta name="keywords" content="RAG, Retrieval Augmented Generation, LLM, Generative AI, RAG Benchmark, AI Evaluation, Vector Search, Streamlit, Machine Learning, Hybrid Search, RRF, Himanshi">
+    <meta name="author" content="Himanshi">
+    <meta name="robots" content="index, follow">
+    <meta name="language" content="English">
+
+    <!-- OpenGraph (Facebook / LinkedIn) -->
+    <meta property="og:title" content="Ragvexa — Advanced RAG Engineering Platform">
+    <meta property="og:description" content="The definitive platform for RAG Engineering. Upload documents, chat with your data, and benchmark retrieval strategies head-to-head. Built by Himanshi.">
+    <meta property="og:type" content="website">
+    <meta property="og:site_name" content="Ragvexa">
+
+    <!-- Twitter Card -->
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="Ragvexa — Advanced RAG Engineering Platform">
+    <meta name="twitter:description" content="Build, test, and benchmark advanced AI retrieval pipelines. The ultimate RAG evaluation tool.">
+""", unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────────────────────────
 # Global Brand CSS
 # ─────────────────────────────────────────────────────────────────
 st.markdown("""
