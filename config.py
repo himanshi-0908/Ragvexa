@@ -18,7 +18,6 @@ if NVIDIA_API_KEY:
 
 CHROMA_DB_DIR = "./chroma_db"
 
-# --- Auth secrets (must come from .env, never hardcode these) ---
 COOKIE_NAME = os.getenv("COOKIE_NAME", "ragvexa_auth")
 COOKIE_SECRET = os.getenv("COOKIE_SECRET")
 JWT_SECRET = os.getenv("JWT_SECRET")
