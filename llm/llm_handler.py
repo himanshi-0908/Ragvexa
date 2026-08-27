@@ -6,7 +6,7 @@ def get_llm():
         raise ValueError("NVIDIA_API_KEY is not set in .env")
     return ChatNVIDIA(
         nvidia_api_key=NVIDIA_API_KEY,
-        model="meta/llama-3.1-8b-instruct",
+        model="meta/llama-3.1-70b-instruct",
         temperature=0.2
     )
 
