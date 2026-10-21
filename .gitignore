@@ -1,8 +1,9 @@
+*.db
+*.pyc
+.DS_Store
 .env
 .venv
 __pycache__/
 chroma_db/
+private_uploads/
 temp/
-.DS_Store
-*.pyc
-*.db

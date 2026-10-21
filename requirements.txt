@@ -11,10 +11,10 @@ python-dotenv
 pypdf
 python-multipart
 beautifulsoup4
+requests
 sqlalchemy
-passlib[bcrypt]
+bcrypt
 PyJWT
-python-multipart
 streamlit-authenticator
 slowapi
 email-validator

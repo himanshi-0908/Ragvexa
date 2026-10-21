@@ -16,7 +16,7 @@ import numpy as np
 from langchain_core.documents import Document
 from langchain_community.retrievers import BM25Retriever
 
-from .vector_store import get_vector_store
+from .vector_store import get_vector_store, tenant_filter
 
 # ─────────────────────────────────────────────
 # Standardised schema
@@ -75,7 +75,7 @@ def _rrf_fuse(ranked_lists: List[List[Document]], k_rrf: int = 60) -> List[tuple
 
 def _build_bm25(user_id: int, k: int) -> Optional[BM25Retriever]:
     vector_store = get_vector_store()
-    res = vector_store.get(where={"user_id": user_id})
+    res = vector_store.get(where=tenant_filter(user_id))
     docs = []
     if res and "documents" in res:
         for text, meta in zip(res["documents"], res["metadatas"]):
@@ -105,7 +105,7 @@ def _pipeline_naive(query: str, user_id: int, k: int) -> PipelineResult:
     vector_store = get_vector_store()
     try:
         raw = vector_store.similarity_search_with_score(
-            query, k=k, filter={"user_id": user_id}
+            query, k=k, filter=tenant_filter(user_id)
         )
         # Chroma returns (doc, distance) — convert L2 distance to similarity
         # score = 1 / (1 + distance)
@@ -127,7 +127,7 @@ def _pipeline_hybrid(query: str, user_id: int, k: int) -> PipelineResult:
     vector_store = get_vector_store()
     try:
         dense_docs = vector_store.similarity_search(
-            query, k=k * 2, filter={"user_id": user_id}
+            query, k=k * 2, filter=tenant_filter(user_id)
         )
         bm25 = _build_bm25(user_id, k=k * 2)
         kw_docs = bm25.invoke(query) if bm25 else []
@@ -152,7 +152,7 @@ def _pipeline_reranker(query: str, user_id: int, k: int) -> PipelineResult:
     error_msg = None
     try:
         dense_docs = vector_store.similarity_search(
-            query, k=k * 3, filter={"user_id": user_id}
+            query, k=k * 3, filter=tenant_filter(user_id)
         )
         bm25 = _build_bm25(user_id, k=k * 3)
         kw_docs = bm25.invoke(query) if bm25 else []
@@ -229,6 +229,7 @@ def retrieve_pipeline(
     strategy: str = "Naive",
     k: int = 5,
 ) -> PipelineResult:
+    tenant_filter(user_id)  # raises on a missing/invalid user_id — never query unscoped
     if strategy == "Naive":
         return _pipeline_naive(query, user_id, k)
     elif strategy == "Hybrid":
