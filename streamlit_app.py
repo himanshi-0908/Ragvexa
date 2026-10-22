@@ -14,7 +14,8 @@ from retriver.vector_store import (
     get_embedding_model_name,
 )
 from retriver.retriver import retrieve_context, retrieve_pipeline, PIPELINE_NAMES
-from llm.llm_handler import get_llm, generate_response_tracked, generate_study_guide
+from llm.llm_handler import ModelUnavailable, get_llm, generate_response_tracked, generate_study_guide
+from llm.model_registry import key_display, validate_key, working_models
 from utils.memory import UserMemory
 from utils.auth_helper import get_credentials, register_user
 from utils.eval_dataset import (
@@ -66,6 +67,7 @@ from config import (
     LLM_MODEL,
     MAX_QUESTION_CHARS,
     MAX_UPLOAD_SIZE_MB,
+    NVIDIA_API_KEY,
 )
 
 from PIL import Image
@@ -277,6 +279,37 @@ user_id = user_record["user_id"]
 _purge_session_for_user(user_id)
 memory = UserMemory(user_id=user_id)
 
+# ── Per-user LLM settings (own key or the server's demo key, chosen models) ──
+_KEY_SS = f"nvidia_key_{user_id}"          # purged with the rest of session state on user change
+
+
+def _llm_settings() -> dict:
+    key = st.session_state.get(_KEY_SS) or None
+    return {
+        "api_key": key,
+        "answer_model": st.session_state.get("answer_model_choice") or LLM_MODEL,
+        "judge_model": st.session_state.get("judge_model_choice") or JUDGE_MODEL,
+        "generator_models": st.session_state.get("generator_models_choice") or EVAL_GENERATOR_MODELS,
+    }
+
+
+def _answer_llm():
+    s = _llm_settings()
+    return get_llm(s["answer_model"], api_key=s["api_key"])
+
+
+def _eval_llm_factory(model_id: str):
+    return get_llm(model_id, api_key=_llm_settings()["api_key"])
+
+
+def _show_switch(llm_or_call) -> None:
+    switched = getattr(llm_or_call, "switched_from", None)
+    if switched:
+        st.warning(
+            f"Model `{switched}` is not available with the active API key, so "
+            f"`{llm_or_call.model}` was used instead. Pick a model in the sidebar to make this permanent."
+        )
+
 
 def _ingest_chunks(chunks, source, doc_hash, kind, size_bytes):
     """Quota check → vector store → ownership row. Returns chunk count."""
@@ -320,6 +353,70 @@ with st.sidebar:
     </div>
     """, unsafe_allow_html=True)
     st.markdown("<br>", unsafe_allow_html=True)
+
+    # API key & models
+    st.markdown("### 🔑 API key & models")
+    settings_now = _llm_settings()
+    has_server_key = bool(NVIDIA_API_KEY)
+    key_mode = st.radio(
+        "Which NVIDIA key should be used?",
+        ["Demo key (server)", "My own key"],
+        index=1 if settings_now["api_key"] else 0,
+        key="key_mode",
+        help="The demo key is for trying the platform. With your own key, your document text goes to NVIDIA under your account. Daily quotas apply either way.",
+    )
+    if key_mode == "My own key":
+        own = st.text_input("NVIDIA API key", type="password", key="own_key_input", placeholder="nvapi-…",
+                            help="Kept only in this browser session; never stored or logged.")
+        kc1, kc2 = st.columns(2)
+        if kc1.button("Use this key", use_container_width=True, key="use_key_btn"):
+            ok, msg, _ = validate_key(own)
+            if ok:
+                st.session_state[_KEY_SS] = own.strip()
+                for k in ("answer_model_choice", "judge_model_choice", "generator_models_choice", "working_models"):
+                    st.session_state.pop(k, None)
+                st.success(msg)
+                st.rerun()
+            else:
+                st.error(msg)
+        if kc2.button("Clear key", use_container_width=True, key="clear_key_btn"):
+            st.session_state.pop(_KEY_SS, None)
+            for k in ("answer_model_choice", "judge_model_choice", "generator_models_choice", "working_models"):
+                st.session_state.pop(k, None)
+            st.rerun()
+        if settings_now["api_key"]:
+            st.caption(f"Active: your key {key_display(settings_now['api_key'])}")
+        else:
+            st.caption("No personal key set yet" + ("; the demo key is used meanwhile." if has_server_key else " and no demo key is configured."))
+    else:
+        if settings_now["api_key"]:
+            st.session_state.pop(_KEY_SS, None)
+            st.rerun()
+        st.caption("Active: demo key" if has_server_key else "No demo key configured. Add NVIDIA_API_KEY to .env or use your own key.")
+
+    active_key = settings_now["api_key"] or NVIDIA_API_KEY
+    with st.expander("Models", expanded=False):
+        st.caption(f"Answer: `{settings_now['answer_model']}` · Judge: `{settings_now['judge_model']}`")
+        if st.button("Check which models work with this key", use_container_width=True, key="probe_btn", disabled=not active_key):
+            with st.spinner("Probing models…"):
+                st.session_state["working_models"] = working_models(
+                    active_key, extra=[LLM_MODEL, JUDGE_MODEL, *EVAL_GENERATOR_MODELS], use_cache=False
+                )
+        avail = st.session_state.get("working_models")
+        if avail is not None:
+            if not avail:
+                st.error("None of the known models answered for this key.")
+            else:
+                st.selectbox("Answer model", avail, key="answer_model_choice",
+                             index=avail.index(settings_now["answer_model"]) if settings_now["answer_model"] in avail else 0)
+                st.selectbox("Judge model", avail, key="judge_model_choice",
+                             index=avail.index(settings_now["judge_model"]) if settings_now["judge_model"] in avail else min(1, len(avail) - 1))
+                st.multiselect("Eval generator models", avail, key="generator_models_choice",
+                               default=[m for m in settings_now["generator_models"] if m in avail] or avail[:1])
+                if st.session_state.get("answer_model_choice") == st.session_state.get("judge_model_choice"):
+                    st.warning("Judge equals the answer model: judge scores will not be independent.")
+        st.caption("If a configured model is unusable for the active key, the app switches to a working one automatically and tells you.")
+    st.divider()
 
     # Usage & quotas
     usage = usage_summary(user_id)
@@ -433,6 +530,8 @@ with main_tab1:
                                                 user_id=user_id,
                                                 source_name=source,
                                                 doc_hash=dh,
+                                                generator_models=_llm_settings()["generator_models"],
+                                                llm_factory=_eval_llm_factory,
                                             )
                                         if saved:
                                             st.info(f"🧪 {saved} synthetic eval queries saved.")
@@ -474,6 +573,8 @@ with main_tab1:
                                                 user_id=user_id,
                                                 source_name=source,
                                                 doc_hash=url_hash,
+                                                generator_models=_llm_settings()["generator_models"],
+                                                llm_factory=_eval_llm_factory,
                                             )
                                         if saved:
                                             st.info(f"🧪 {saved} synthetic eval queries saved.")
@@ -500,12 +601,13 @@ with main_tab1:
                     if not ctx.strip():
                         st.warning("Please ingest some documents first.")
                     else:
-                        llm = get_llm()
+                        llm = _answer_llm()
                         guide = generate_study_guide(llm, ctx)
                         record_usage(user_id, "query")
                         st.session_state["study_guide"] = guide
+                        _show_switch(llm)
                         st.success("Synthesis report ready!")
-                except QuotaExceeded as e:
+                except (QuotaExceeded, ModelUnavailable, ValueError) as e:
                     st.error(f"{e}")
                 except Exception as e:
                     st.error(f"Error: {e}")
@@ -551,11 +653,12 @@ with main_tab1:
 
                         # Generate answer
                         history_str = memory.get_history_string(limit=3)
-                        llm = get_llm()
+                        llm = _answer_llm()
                         call = generate_response_tracked(llm, context, question, history_string=history_str)
                         answer = call.text
                         memory.add_interaction(question, answer)
                         record_usage(user_id, "query", call.input_tokens, call.output_tokens, call.cost_usd)
+                        _show_switch(call)
 
                         with st.chat_message("assistant"):
                             st.markdown(
@@ -582,7 +685,7 @@ with main_tab1:
                                     f"**Retrieval latency:** `{pipeline_res.retrieval_latency_ms} ms`"
                                     + (f" | **Reranking:** `{pipeline_res.reranking_latency_ms} ms`"
                                        if pipeline_res.reranking_latency_ms else "")
-                                    + f" | **Generation:** `{call.latency_ms} ms`"
+                                    + f" | **Generation:** `{call.latency_ms} ms` (`{call.model}`)"
                                     + f" | **Tokens:** `{call.input_tokens}+{call.output_tokens}`"
                                     + cost_s
                                 )
@@ -595,7 +698,7 @@ with main_tab1:
                                         f"> {chunk.text[:400]}{'…' if len(chunk.text) > 400 else ''}"
                                     )
 
-                    except QuotaExceeded as e:
+                    except (QuotaExceeded, ModelUnavailable, ValueError) as e:
                         st.error(f"{e}")
                     except Exception as e:
                         st.error(f"Error: {e}")
@@ -741,17 +844,22 @@ with main_tab2:
                 disabled=(reviewed_q == 0),
                 help="Restrict the dataset to items you marked as reviewed in the Ground Truth tab.",
             )
+            bench_settings = _llm_settings()
             include_llm = st.checkbox(
                 "Include LLM-judge metrics",
                 value=False,
                 help=(
-                    f"Generates an answer with {LLM_MODEL} and scores it with the independent judge "
-                    f"{JUDGE_MODEL} on relevance, faithfulness, groundedness and correctness. "
+                    f"Generates an answer with {bench_settings['answer_model']} and scores it with the independent judge "
+                    f"{bench_settings['judge_model']} on relevance, faithfulness, groundedness and correctness. "
                     "Makes 6 LLM calls per query per pipeline; token usage is recorded."
                 ),
             )
-            if include_llm and JUDGE_MODEL == LLM_MODEL:
-                st.warning("JUDGE_MODEL equals LLM_MODEL — judge scores will not be independent.")
+            if include_llm and bench_settings["judge_model"] == bench_settings["answer_model"]:
+                st.warning("Judge model equals the answer model — judge scores will not be independent.")
+            st.caption(
+                f"Key: {'your key ' + key_display(bench_settings['api_key']) if bench_settings['api_key'] else 'demo key'} · "
+                f"answer `{bench_settings['answer_model'].split('/')[-1]}` · judge `{bench_settings['judge_model'].split('/')[-1]}`"
+            )
 
             effective_q = reviewed_q if reviewed_only else unique_q
             run_btn = st.button(
@@ -793,11 +901,14 @@ with main_tab2:
                         progress_callback=_progress,
                         force_rerun=True,
                         reviewed_only=reviewed_only,
+                        api_key=bench_settings["api_key"],
+                        answer_model=bench_settings["answer_model"],
+                        judge_model=bench_settings["judge_model"],
                     )
                     st.session_state["benchmark_report"] = report
                     progress_bar.progress(100, text="✅ Benchmark complete")
                     status_text.empty()
-                except QuotaExceeded as e:
+                except (QuotaExceeded, ModelUnavailable, ValueError) as e:
                     st.error(f"{e}")
                 except Exception as e:
                     st.error(f"Benchmark failed: {e}")

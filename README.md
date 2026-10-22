@@ -141,6 +141,35 @@ Every run stores its configuration (K, pipelines, dataset fingerprint, dataset s
 
 ---
 
+## Bring your own API key, and automatic model fallback
+
+Two ways to run the LLM side:
+
+| Mode | Who pays | How |
+|---|---|---|
+| **Demo key** (default) | You, the operator | `NVIDIA_API_KEY` in `.env`. Testers just sign up and use the app. |
+| **Own key** | The user | Sidebar → **API key & models** → "My own key". The key is validated against the NVIDIA models endpoint, kept only in that browser session, and never stored or logged. Their document text then goes to NVIDIA under their own account. |
+
+Per-user daily quotas apply in both modes, so nobody can use the server as a free proxy.
+
+**Automatic model fallback.** If the active key cannot use a configured model (retired, not enabled for the account, or forbidden), the app does not fail. It probes a short list of known model ids once per key (cached by key fingerprint for an hour), switches to the first one that answers, and tells you:
+
+- chat shows a warning naming the model that was used instead;
+- the benchmark run config records `model_switches` and the Limitations box repeats it;
+- the API response carries `model` and `model_switched_from`.
+
+To make a choice permanent, open **Models** in the sidebar, click "Check which models work with this key", and pick the answer, judge and eval-generator models from the ones that answered. Reasoning models (slower, token-heavy) are offered last for answers. The same probe is available from the command line as `python scripts/check_models.py --probe`.
+
+API users can pass their own key per request:
+
+```bash
+curl -s -X POST localhost:8000/query -H "Authorization: Bearer TOKEN" -H "X-NVIDIA-API-Key: nvapi-..." -H "Content-Type: application/json" -d '{"question": "..."}'
+```
+
+The header is used for that request only. Key problems come back as HTTP 400 with the reason, never as a 500.
+
+---
+
 ## Security model
 
 | Concern | Implementation |
@@ -153,6 +182,7 @@ Every run stores its configuration (K, pipelines, dataset fingerprint, dataset s
 | URL ingestion (SSRF) | The URL and **every redirect hop** are resolved and checked against loopback, private, link-local, multicast, reserved and `.localhost` ranges; literal IPs are judged directly. Only text/HTML content types are accepted and the body is capped at `MAX_URL_FETCH_BYTES`. |
 | Quotas | Per-user caps on documents, total chunks, queries per day and benchmarks per day (server-side, in `utils/documents.py`). FastAPI also rate-limits by IP. |
 | External data disclosure | Document text, questions and answers are sent to the NVIDIA API. A notice is shown in the sidebar and above ingestion. Embeddings are computed locally. |
+| User API keys | Kept in Streamlit session state only (purged on user change or sign-out); API header keys are per request. Cache and reports hold a SHA-256 fingerprint or the last four characters, never the key. |
 | Complete deletion | Per-document delete and "Delete all my data" (index, documents, eval items, chats, runs, usage). |
 | Logging | Logs record user ids and counts, never document text, passwords or API keys. |
 
@@ -219,6 +249,7 @@ python -m pytest tests/ -q
 | `test_tenant_isolation.py` | Tenant filter on every pipeline, scoped deletion, chat/eval/run isolation, cache keys |
 | `test_authorization.py` | FastAPI auth, ownership (404 on foreign documents), quotas, upload validation, SSRF via API |
 | `test_ingestion_security.py` | SSRF guard incl. redirects and DNS-to-private, content type and size caps, upload validation, private storage permissions |
+| `test_api_keys.py` | Key validation and fingerprinting, probe cache, auto model switch (404/410/403, not 401), benchmark records switches without the key, per-request API header |
 | `test_evaluation.py` | Cross-model generation + dedup, ground-truth import, usage/cost tracking, judge independence, failure classification, benchmark runner |
 
 All tests run offline: the vector store, HTTP and LLM calls are mocked.
@@ -248,7 +279,8 @@ Ragvexa/
 │   ├── retriver.py         # 4 pipelines + PipelineResult schema (tenant-scoped)
 │   └── vector_store.py     # ChromaDB helpers, tenant_filter, scoped delete
 ├── llm/
-│   └── llm_handler.py      # NVIDIA models, invoke_tracked (tokens/cost), judge
+│   ├── llm_handler.py      # NvidiaChat wrapper: per-user key, auto model fallback, invoke_tracked
+│   └── model_registry.py   # Key validation, model probing/cache, suggestions
 ├── utils/
 │   ├── auth_helper.py      # Registration + credential loading (Streamlit)
 │   ├── benchmark.py        # Runner, failure classifier, persisted runs, export

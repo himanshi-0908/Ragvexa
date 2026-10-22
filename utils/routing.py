@@ -1,9 +1,10 @@
 import logging
 import os
+from typing import Optional
 from datetime import datetime, timedelta
 
 import jwt
-from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Request
+from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Request, Header
 from fastapi.security import OAuth2PasswordRequestForm, OAuth2PasswordBearer
 import bcrypt
 from pydantic import BaseModel, Field
@@ -48,7 +49,7 @@ from utils.security import (
 )
 from retriver.vector_store import add_to_vector_store
 from retriver.retriver import retrieve_pipeline, PIPELINE_NAMES
-from llm.llm_handler import get_llm, generate_response_tracked
+from llm.llm_handler import ModelUnavailable, get_llm, generate_response_tracked
 
 logger = logging.getLogger("ragvexa")
 
@@ -264,7 +265,13 @@ async def query_model(
     request: Request,
     body: QueryRequest,
     user_id: int = Depends(get_current_user_id),
+    x_nvidia_api_key: Optional[str] = Header(default=None, alias="X-NVIDIA-API-Key"),
 ):
+    """Answer a question over the caller's own documents.
+
+    Pass your own NVIDIA key in the X-NVIDIA-API-Key header to use it for this
+    request only (it is never stored or logged); otherwise the server's demo
+    key is used. Daily quotas apply either way."""
     if body.strategy not in PIPELINE_NAMES:
         raise HTTPException(status_code=400, detail=f"Unknown strategy. Choose one of {PIPELINE_NAMES}")
     try:
@@ -274,7 +281,7 @@ async def query_model(
     try:
         result = retrieve_pipeline(body.question, user_id=user_id, strategy=body.strategy, k=body.k)
         context = "\n\n".join(c.text for c in result.chunks)
-        llm = get_llm()
+        llm = get_llm(api_key=x_nvidia_api_key)
         call = generate_response_tracked(llm, context, body.question)
 
         memory = UserMemory(user_id=user_id)
@@ -286,9 +293,15 @@ async def query_model(
             "context_used": context,
             "sources": [{"source": c.source, "chunk_id": c.chunk_id, "score": c.score} for c in result.chunks],
             "usage": {"input_tokens": call.input_tokens, "output_tokens": call.output_tokens, "cost_usd": call.cost_usd},
+            "model": call.model,
+            "model_switched_from": call.switched_from,
+            "api_key_source": "user" if x_nvidia_api_key else "server",
         }
     except HTTPException:
         raise
+    except (ModelUnavailable, ValueError) as e:
+        # Model/key problems are the caller's to fix: say what, without leaking anything.
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception:
         logger.exception("Query failed for user_id=%s", user_id)
         raise HTTPException(status_code=500, detail="Query failed")

@@ -163,6 +163,9 @@ def run_benchmark(
     persist: bool = True,
     enforce_quota: bool = True,
     candidate_pool_fn: Optional[Callable[[str], List[str]]] = None,
+    api_key: Optional[str] = None,
+    answer_model: Optional[str] = None,
+    judge_model: Optional[str] = None,
 ) -> BenchmarkReport:
     """
     Run the benchmark for the given user.
@@ -179,6 +182,8 @@ def run_benchmark(
         enforce_quota: apply the per-user daily benchmark quota
         candidate_pool_fn: query -> wider candidate chunk ids (for failure analysis);
                            defaults to Naive retrieval at 4*k
+        api_key: the user's own NVIDIA key; None means the server (demo) key
+        answer_model / judge_model: override the configured model ids
     """
     from utils.documents import check_daily_quota, record_usage
 
@@ -208,11 +213,14 @@ def run_benchmark(
     from config import LLM_MODEL, JUDGE_MODEL, MODEL_PRICES
     from retriver.vector_store import get_embedding_model_name, get_user_chunk_ids
 
+    from llm.model_registry import key_display
+    answer_model = answer_model or LLM_MODEL
+    judge_model = judge_model or JUDGE_MODEL
     llm = judge_llm = None
     if include_llm_judges:
         from llm.llm_handler import get_llm, get_judge_llm
-        llm = get_llm()
-        judge_llm = get_judge_llm()
+        llm = get_llm(answer_model, api_key=api_key)
+        judge_llm = get_judge_llm(api_key=api_key, model=judge_model)
 
     try:
         indexed_ids = get_user_chunk_ids(user_id)
@@ -233,9 +241,11 @@ def run_benchmark(
         "pipelines": list(pipelines),
         "include_llm_judges": include_llm_judges,
         "reviewed_only": reviewed_only,
-        "generator_model": LLM_MODEL if include_llm_judges else None,
-        "judge_model": JUDGE_MODEL if include_llm_judges else None,
-        "judge_independent": (JUDGE_MODEL != LLM_MODEL) if include_llm_judges else None,
+        "generator_model": answer_model if include_llm_judges else None,
+        "judge_model": judge_model if include_llm_judges else None,
+        "judge_independent": (judge_model != answer_model) if include_llm_judges else None,
+        "api_key_source": "user" if api_key else "server",
+        "api_key_display": key_display(api_key) if api_key else "server key",
         "embedding_model": get_embedding_model_name(),
         "dataset_fingerprint": fingerprint,
         "dataset_size": len(queries),
@@ -324,6 +334,16 @@ def run_benchmark(
 
     total_duration_ms = int((time.time() - global_t0) * 1000)
     config["finished_at"] = time.time()
+    switches = {}
+    if llm is not None and getattr(llm, "switched_from", None):
+        switches["generator"] = {"from": llm.switched_from, "to": llm.model}
+        config["generator_model"] = llm.model
+    if judge_llm is not None and getattr(judge_llm, "switched_from", None):
+        switches["judge"] = {"from": judge_llm.switched_from, "to": judge_llm.model}
+        config["judge_model"] = judge_llm.model
+    if switches:
+        config["model_switches"] = switches
+        config["judge_independent"] = config["judge_model"] != config["generator_model"]
 
     report = BenchmarkReport(
         pipelines=list(pipelines),
@@ -502,6 +522,9 @@ def get_limitations(report: BenchmarkReport) -> List[str]:
         if cfg.get("judge_independent") is False:
             notes.append("The judge model is the same as the generator; judge scores may be biased.")
         notes.append("Judge scores are LLM opinions on a 0–1 scale and are not a substitute for human review.")
+    for role, sw in (cfg.get("model_switches") or {}).items():
+        notes.append(f"The {role} model '{sw['from']}' was not usable with the active API key; "
+                     f"'{sw['to']}' was used instead.")
     if cfg.get("include_llm_judges") and not cfg.get("prices_configured"):
         notes.append("Cost is reported as n/a because MODEL_PRICES_JSON is not configured; token counts are exact.")
     if size and size < 20:
