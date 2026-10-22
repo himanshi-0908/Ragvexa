@@ -18,5 +18,6 @@ PyJWT
 streamlit-authenticator
 slowapi
 email-validator
+rank_bm25
 sentence-transformers
 

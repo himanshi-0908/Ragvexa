@@ -198,3 +198,32 @@ class TestBackwardCompat:
         _patch_vs(mock_vs_cls)
         with pytest.raises(ValueError):
             retrieve_pipeline("test", user_id=1, strategy="NonExistent", k=3)
+
+
+# ─────────────────────────────────────────────
+# Errors are surfaced, never swallowed silently
+# ─────────────────────────────────────────────
+class TestErrorsSurfaced:
+    @patch("retriver.retriver._build_bm25", side_effect=ImportError("Could not import rank_bm25"))
+    @patch("retriver.retriver.get_vector_store")
+    def test_hybrid_degrades_to_dense_when_bm25_missing(self, mock_vs_cls, _bm25):
+        _patch_vs(mock_vs_cls)
+        result = retrieve_pipeline("test query", user_id=1, strategy="Hybrid", k=3)
+        assert result.chunks, "Hybrid must still return the dense results"
+        assert result.error and "BM25 unavailable" in result.error
+
+    @patch("retriver.retriver._build_bm25", side_effect=ImportError("Could not import rank_bm25"))
+    @patch("retriver.retriver.get_vector_store")
+    def test_reranker_degrades_when_bm25_missing(self, mock_vs_cls, _bm25):
+        _patch_vs(mock_vs_cls)
+        result = retrieve_pipeline("test query", user_id=1, strategy="Hybrid + Reranker", k=3)
+        assert result.chunks
+        assert result.error and "BM25 unavailable" in result.error
+
+    @patch("retriver.retriver.get_vector_store")
+    def test_naive_reports_store_failure(self, mock_vs_cls):
+        vs = _patch_vs(mock_vs_cls)
+        vs.similarity_search_with_score.side_effect = RuntimeError("chroma down")
+        result = retrieve_pipeline("test query", user_id=1, strategy="Naive", k=3)
+        assert result.chunks == []
+        assert result.error and "chroma down" in result.error

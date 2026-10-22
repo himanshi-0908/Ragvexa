@@ -113,10 +113,12 @@ def _pipeline_naive(query: str, user_id: int, k: int) -> PipelineResult:
             _doc_to_chunk(doc, rank + 1, 1.0 / (1.0 + dist), "Naive")
             for rank, (doc, dist) in enumerate(raw)
         ]
+        error_msg = None
     except Exception as e:
         chunks = []
+        error_msg = f"Dense retrieval failed ({e})"
     latency = int((time.time() - t0) * 1000)
-    return PipelineResult("Naive", chunks, latency)
+    return PipelineResult("Naive", chunks, latency, error=error_msg)
 
 # ─────────────────────────────────────────────
 # Pipeline 2: Hybrid Dense + BM25 with RRF
@@ -125,12 +127,19 @@ def _pipeline_naive(query: str, user_id: int, k: int) -> PipelineResult:
 def _pipeline_hybrid(query: str, user_id: int, k: int) -> PipelineResult:
     t0 = time.time()
     vector_store = get_vector_store()
+    error_msg = None
     try:
         dense_docs = vector_store.similarity_search(
             query, k=k * 2, filter=tenant_filter(user_id)
         )
-        bm25 = _build_bm25(user_id, k=k * 2)
-        kw_docs = bm25.invoke(query) if bm25 else []
+        try:
+            bm25 = _build_bm25(user_id, k=k * 2)
+            kw_docs = bm25.invoke(query) if bm25 else []
+        except Exception as e:
+            # Keyword side unavailable (e.g. rank_bm25 not installed): degrade to
+            # dense-only rather than returning nothing, and say so.
+            kw_docs = []
+            error_msg = f"BM25 unavailable ({e}); using dense results only"
         fused = _rrf_fuse([dense_docs, kw_docs])[:k]
         fused = _ndcg_normalize(fused)
         chunks = [
@@ -139,8 +148,9 @@ def _pipeline_hybrid(query: str, user_id: int, k: int) -> PipelineResult:
         ]
     except Exception as e:
         chunks = []
+        error_msg = f"Hybrid retrieval failed ({e})"
     latency = int((time.time() - t0) * 1000)
-    return PipelineResult("Hybrid", chunks, latency)
+    return PipelineResult("Hybrid", chunks, latency, error=error_msg)
 
 # ─────────────────────────────────────────────
 # Pipeline 3: Hybrid + Cosine Reranker
@@ -154,8 +164,12 @@ def _pipeline_reranker(query: str, user_id: int, k: int) -> PipelineResult:
         dense_docs = vector_store.similarity_search(
             query, k=k * 3, filter=tenant_filter(user_id)
         )
-        bm25 = _build_bm25(user_id, k=k * 3)
-        kw_docs = bm25.invoke(query) if bm25 else []
+        try:
+            bm25 = _build_bm25(user_id, k=k * 3)
+            kw_docs = bm25.invoke(query) if bm25 else []
+        except Exception as e:
+            kw_docs = []
+            error_msg = f"BM25 unavailable ({e}); using dense candidates only"
         candidates = _rrf_fuse([dense_docs, kw_docs])
         candidates = [doc for doc, _ in candidates]
     except Exception as e:

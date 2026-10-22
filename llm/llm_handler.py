@@ -28,13 +28,41 @@ class LLMCall:
     cost_usd: Optional[float]   # None when no price is configured for the model
 
 
-def get_llm(model: Optional[str] = None, temperature: float = 0.2):
+class ModelUnavailable(RuntimeError):
+    """The NVIDIA API rejected the configured model id for this key."""
+
+
+def explain_model_error(model: str, exc: Exception) -> Optional[str]:
+    """Turn NVIDIA 401/403/404/410 responses into an actionable message, else None."""
+    text = str(exc)
+    if "[410]" in text or "end of life" in text:
+        return (f"Model '{model}' has been retired by NVIDIA. Set LLM_MODEL / JUDGE_MODEL / "
+                "EVAL_GENERATOR_MODELS in .env to a current id (run: python scripts/check_models.py --probe).")
+    if "[404]" in text and "account" in text:
+        return (f"Model '{model}' is not enabled for your NVIDIA key. Pick one your key can use "
+                "(run: python scripts/check_models.py --probe) and set it in .env.")
+    if "[403]" in text or "Authorization failed" in text:
+        return (f"NVIDIA refused model '{model}' for this key (403). The key may lack access to this model; "
+                "run: python scripts/check_models.py --probe and set a working id in .env.")
+    if "[401]" in text:
+        return "NVIDIA rejected the API key (401). Check NVIDIA_API_KEY in .env."
+    return None
+
+
+def get_llm(model: Optional[str] = None, temperature: float = 0.2, max_tokens: int = 2048):
+    """
+    ChatNVIDIA for any NIM model id. max_tokens is raised above the library's
+    1024 default because reasoning models (e.g. nemotron-3.5-lightning) spend
+    hundreds of tokens thinking before the visible answer; if the cap is hit
+    the visible answer comes back empty.
+    """
     if not NVIDIA_API_KEY:
         raise ValueError("NVIDIA_API_KEY is not set in .env")
     return ChatNVIDIA(
         nvidia_api_key=NVIDIA_API_KEY,
         model=model or LLM_MODEL,
         temperature=temperature,
+        max_tokens=max_tokens,
     )
 
 
@@ -75,7 +103,13 @@ def extract_usage(response) -> tuple[int, int]:
 def invoke_tracked(llm, prompt: str) -> LLMCall:
     """Invoke the model and return text + usage + latency + estimated cost."""
     t0 = time.time()
-    response = llm.invoke(prompt)
+    try:
+        response = llm.invoke(prompt)
+    except Exception as e:
+        friendly = explain_model_error(_model_name(llm), e)
+        if friendly:
+            raise ModelUnavailable(friendly) from e
+        raise
     latency_ms = int((time.time() - t0) * 1000)
     text = (getattr(response, "content", None) or str(response)).strip()
     in_tok, out_tok = extract_usage(response)
@@ -102,8 +136,7 @@ Context:
 
 Question: {question}
 Answer:"""
-    response = llm.invoke(prompt)
-    return response.content
+    return invoke_tracked(llm, prompt).text
 
 
 def generate_response_tracked(llm, context, question, history_string="") -> LLMCall:
@@ -132,5 +165,4 @@ Context:
 {context}
 
 Study Guide:"""
-    response = llm.invoke(prompt)
-    return response.content
+    return invoke_tracked(llm, prompt).text

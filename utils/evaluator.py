@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import math
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional
 
 # ─────────────────────────────────────────────
@@ -74,6 +76,7 @@ class UsageTracker:
     """Accumulates token usage and cost across generation and judge calls."""
 
     def __init__(self):
+        self._lock = threading.Lock()
         self.gen_input = 0
         self.gen_output = 0
         self.judge_input = 0
@@ -85,6 +88,10 @@ class UsageTracker:
     def add(self, call, role: str) -> None:
         if call is None:
             return
+        with self._lock:
+            self._add(call, role)
+
+    def _add(self, call, role: str) -> None:
         self._calls += 1
         if role == "gen":
             self.gen_input += call.input_tokens
@@ -326,11 +333,23 @@ def evaluate_query(
         result["judge_independent"] = bool(
             judge_llm is not None and getattr(judge, "model", None) != getattr(llm, "model", None)
         )
-        result["context_relevance"] = context_relevance(judge, query, context, usage)
-        result["answer_faithfulness"] = answer_faithfulness(judge, context, answer, usage)
-        result["answer_groundedness"] = answer_groundedness(judge, context, answer, usage)
-        result["answer_relevance"] = answer_relevance(judge, query, answer, usage)
-        result["answer_correctness"] = answer_correctness(judge, query, reference_answer, answer, usage)
+        # The five judge questions are independent, so run them concurrently:
+        # wall-clock becomes one judge call instead of five (matters for
+        # reasoning judges that take several seconds per call).
+        judge_jobs = {
+            "context_relevance": lambda: context_relevance(judge, query, context, usage),
+            "answer_faithfulness": lambda: answer_faithfulness(judge, context, answer, usage),
+            "answer_groundedness": lambda: answer_groundedness(judge, context, answer, usage),
+            "answer_relevance": lambda: answer_relevance(judge, query, answer, usage),
+            "answer_correctness": lambda: answer_correctness(judge, query, reference_answer, answer, usage),
+        }
+        with ThreadPoolExecutor(max_workers=len(judge_jobs)) as pool:
+            futures = {name: pool.submit(fn) for name, fn in judge_jobs.items()}
+            for name, fut in futures.items():
+                try:
+                    result[name] = fut.result()
+                except Exception:
+                    result[name] = None
         result.update(usage.as_dict())
 
     return result

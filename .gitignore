@@ -7,3 +7,5 @@ __pycache__/
 chroma_db/
 private_uploads/
 temp/
+.env.*
+!.env.example

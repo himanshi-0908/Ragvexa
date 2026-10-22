@@ -86,18 +86,20 @@ ALLOWED_ORIGINS = [
 ]
 
 # --- LLM models (NVIDIA NIM ids) ---
+# NVIDIA retires models and not every key can invoke every model. Verify with
+#   python scripts/check_models.py --probe
 # Chat / answer generation model.
-LLM_MODEL = os.getenv("LLM_MODEL", "nvidia/nemotron-3-super-120b-a12b")
+LLM_MODEL = os.getenv("LLM_MODEL", "nvidia/nemotron-3-ultra-550b-a55b")
 # Models used to GENERATE evaluation questions (comma-separated). Using more
 # than one model reduces single-model bias in the synthetic dataset.
 EVAL_GENERATOR_MODELS = [
     m.strip()
-    for m in os.getenv("EVAL_GENERATOR_MODELS", f"{LLM_MODEL},meta/llama-3.1-70b-instruct").split(",")
+    for m in os.getenv("EVAL_GENERATOR_MODELS", f"{LLM_MODEL},nvidia/nemotron-3.5-lightning-30b-a3b").split(",")
     if m.strip()
 ]
 # Independent judge model. Should differ from the answer model so the judge
 # is not grading its own output.
-JUDGE_MODEL = os.getenv("JUDGE_MODEL", "meta/llama-3.1-70b-instruct")
+JUDGE_MODEL = os.getenv("JUDGE_MODEL", "nvidia/nemotron-3.5-lightning-30b-a3b")
 
 # --- Pricing (USD per 1M tokens) used ONLY to estimate cost. ---
 # Format: {"model-id": {"input": 0.0, "output": 0.0}}. When a model has no

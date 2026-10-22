@@ -92,7 +92,7 @@ score(d) = Σ  1 / (k_rrf + rank_i(d))
 | **Answer Relevance** | Does the answer address the query? |
 | **Correctness** | Does the answer agree with the reference answer? (only when a reference exists) |
 
-The judge is a **separate model** (`JUDGE_MODEL`) from the answer model (`LLM_MODEL`) so it is not grading its own output. If you configure them to be the same, the UI and report say so. A judge failure yields "not scored", never a fallback number.
+The judge is a **separate model** (`JUDGE_MODEL`) from the answer model (`LLM_MODEL`) so it is not grading its own output. The five judge questions per answer run concurrently, so a judged query costs about one judge call of wall-clock time. Defaults (verified 2026-10-22): answers from `nvidia/nemotron-3-ultra-550b-a55b` (fast, ~40 output tokens), judging by `nvidia/nemotron-3.5-lightning-30b-a3b` (a reasoning model: several seconds and a few hundred tokens per call). Set `JUDGE_MODEL` to the ultra model if you need speed over independence; the UI will warn that the judge is not independent. If you configure them to be the same, the UI and report say so. A judge failure yields "not scored", never a fallback number.
 
 ### Latency, tokens and cost
 
@@ -178,7 +178,13 @@ cp .env.example .env
 python -c "import secrets; print(secrets.token_hex(32))"   # run twice: COOKIE_SECRET, JWT_SECRET
 ```
 
-Fill in `NVIDIA_API_KEY`, `COOKIE_SECRET`, `JWT_SECRET`. Optional: `LLM_MODEL`, `JUDGE_MODEL`, `EVAL_GENERATOR_MODELS`, quotas, and `MODEL_PRICES_JSON` for cost estimates. See `.env.example` for every setting.
+Fill in `NVIDIA_API_KEY`, `COOKIE_SECRET`, `JWT_SECRET`. Then confirm your key can invoke the configured models, because NVIDIA retires models (HTTP 410) and not every key is entitled to every model (HTTP 404 "not found for account"):
+
+```bash
+python scripts/check_models.py --probe
+```
+
+It prints one line per configured model with the HTTP status and, if any fail, lists ids that work for your key. Put those in `.env`. Optional: `LLM_MODEL`, `JUDGE_MODEL`, `EVAL_GENERATOR_MODELS`, quotas, and `MODEL_PRICES_JSON` for cost estimates. See `.env.example` for every setting.
 
 ### 3. Run
 
@@ -186,6 +192,16 @@ Fill in `NVIDIA_API_KEY`, `COOKIE_SECRET`, `JWT_SECRET`. Optional: `LLM_MODEL`, 
 streamlit run streamlit_app.py          # UI on :8501
 uvicorn app:app --reload                # optional API on :8000
 ```
+
+---
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Chat shows `[403] Forbidden Authorization failed`, `[404] ... Not found for account` or `[410]` | The model id is retired or not enabled for your key | `python scripts/check_models.py --probe`, then set working ids in `.env` |
+| Tokens column is 0 after a judged benchmark | The model did not return usage metadata | Check `scripts/check_models.py` output shows token counts for that model |
+| `COOKIE_SECRET is not set` on startup | `.env` missing or not in the working directory | `cp .env.example .env` and fill it in |
 
 ---
 
@@ -246,6 +262,8 @@ Ragvexa/
 │   ├── routing.py          # FastAPI routes (JWT, ownership, quotas)
 │   └── security.py         # SSRF guard, upload validation, private storage
 ├── tests/
+├── scripts/
+│   └── check_models.py     # Verify the NVIDIA key can invoke configured models
 ├── streamlit_app.py        # Main UI
 ├── app.py                  # FastAPI entry point
 └── config.py               # Environment config
