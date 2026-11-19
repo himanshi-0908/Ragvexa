@@ -8,7 +8,8 @@ Ragvexa is a secure, multi-user **Retrieval-Augmented Generation (RAG) engineeri
 2. **Chat** with their data using a configurable retrieval strategy
 3. **Benchmark** four retrieval pipelines head-to-head on identical datasets and settings
 4. **Evaluate** answers with an independent judge model, human-reviewed ground truth, token usage and cost
-5. **Diagnose** failures by stage (missing evidence, retrieval, ranking, generation) and export reproducible reports
+5. **Test with their own cases**: upload questions with gold evidence (document, pages, passage) and unanswerable questions, run every strategy on the same snapshot, and see the evidence behind every number with bootstrap confidence intervals
+6. **Diagnose** failures by stage (missing evidence, retrieval, ranking, generation) and export reproducible reports
 
 ---
 
@@ -43,8 +44,10 @@ Ragvexa is a secure, multi-user **Retrieval-Augmented Generation (RAG) engineeri
    ┌───────────────────────────────▼────────────────────────────────┐
    │ SQLite: users · documents (ownership) · chat_history ·          │
    │         synthetic_eval (origin/reviewed/reference) ·            │
+   │         test_sets · test_cases · test_case_evidence ·           │
    │         benchmark_runs · usage_events                           │
-   │ ChromaDB: chunks tagged {user_id, source, chunk_id}             │
+   │ ChromaDB: chunks tagged {user_id, source, chunk_id,             │
+   │           document_id, page_start/end, char_start/end}          │
    │ private_uploads/<user_id>/ (0700, deleted after parsing)        │
    └────────────────────────────────────────────────────────────────┘
 ```
@@ -141,6 +144,80 @@ Every run stores its configuration (K, pipelines, dataset fingerprint, dataset s
 
 ---
 
+## User test sets and evidence-based evaluation
+
+Synthetic questions are generated *from* a chunk, which makes retrieval artificially easy. The most credible ground truth is a set of questions you wrote yourself, each pointing at **where** the answer is in your documents. **Benchmark → Test Sets** takes such a file, validates it, and every strategy is then evaluated on the same cases with metrics that are computed by matching retrieved chunks to your evidence, never by chunk id.
+
+### Test case format (CSV or JSON)
+
+| Field | Required | Description |
+|---|---|---|
+| `question` | yes | The user question |
+| `expected_answer` | no | Reference answer; enables correctness scoring by the judge |
+| `answerable` | yes | `true` / `false`. `false` means the answer is **not** in your documents (tests abstention) |
+| `gold_evidence` | if `answerable=true` | One or more items `{"document": "policy.pdf", "pages": [4], "passage": "exact or near-exact text"}` |
+| `tags` | no | Free labels (`table`, `multi-hop`, …) for per-tag breakdowns |
+
+```json
+[
+  {"question": "What is the refund window?",
+   "expected_answer": "30 days from purchase.",
+   "answerable": true,
+   "gold_evidence": [{"document": "policy.pdf", "pages": [4],
+                      "passage": "Refunds are accepted within 30 days of purchase."}],
+   "tags": ["policy"]},
+  {"question": "Who is the CEO?", "answerable": false}
+]
+```
+
+In CSV, `gold_evidence` is a JSON string, or use the columns `evidence_document`, `evidence_pages`, `evidence_passage` for the single-evidence case. `pages` accepts `4`, `4-6` or `[4, 6]`; TXT and URL sources have no pages, so give a passage.
+
+### Validation on upload
+
+The file is parsed as untrusted input (size cap `MAX_TEST_SET_MB`, row cap `MAX_TEST_SET_ROWS`, length limits) and every row is checked before anything is saved: required fields, `answerable=true` must have evidence and `answerable=false` must have none, the `document` must be one of **your** documents (never another user's), a `passage` must actually appear in that document on the given pages (fuzzy token match against the indexed chunks), and identical questions are flagged as duplicates. The preview lists each row with its errors and warnings; you can fix the file or save only the valid rows.
+
+### How retrieval is matched to gold evidence
+
+Strategies use different chunk sizes, so a retrieved chunk is a **hit** for a gold item when:
+
+1. it comes from the same document, and
+2. its page range overlaps the gold pages (when both sides have pages), and
+3. if the gold item has a passage: at least `overlap_threshold` (default 0.5, `EVIDENCE_OVERLAP_THRESHOLD`, adjustable per run) of the passage's normalised tokens are in the chunk, or the character ranges overlap by that fraction.
+
+Without a passage the document/page match counts and is flagged as a **coarse match**. To make this possible, every chunk records its origin at ingest: `document_id`, `page_start`/`page_end` (PDF) and `char_start`/`char_end` (offsets in the whitespace-normalised document text).
+
+### Metrics
+
+| Group | Metrics | Over |
+|---|---|---|
+| Retrieval | Hit rate@K, Recall@K (gold items matched in top-K), MRR, nDCG@K | answerable cases |
+| Abstention | Correct-abstention rate (the answer says the documents do not contain it), false-answer rate | unanswerable cases (needs generated answers) |
+| Answer quality | Faithfulness, groundedness, relevance, correctness vs `expected_answer` | judged cases |
+
+Every mean is reported with a **bootstrap 95% confidence interval** over test cases (percentile bootstrap, fixed seed). Below `MIN_CASES_FOR_CI` cases (default 10) the UI shows *not enough data* instead of an interval and no verdict should be drawn. When cases carry tags, the retrieval metrics are also broken down per tag.
+
+Failure labels per case and strategy: `missing_evidence` (the gold document has no chunks in the index), `retrieval` (evidence indexed but not in the wider candidate pool), `ranking` (in the pool but outside top-K), `generation` (evidence retrieved but the judged answer scored below 0.5, or an unanswerable question was answered), `ok`.
+
+### Evidence view
+
+For every test case and strategy the results show the question, expected answer and answerable flag; the retrieved chunks in rank order with source, page, snippet and score, each marked hit or miss with the gold item it matched and why; the gold evidence text itself; the generated answer with the judge verdicts; and the failure label. The aggregate table of strategies × metrics (with intervals) sits above it, with filters for failed cases only, by tag and by strategy, and a formula-safe CSV download.
+
+### Snapshots and reproducibility
+
+When a run starts, the test set is snapshotted into an immutable JSON copy that is stored with the run configuration (`test_set_snapshot`, plus its fingerprint). All strategies iterate over that same copy, and reloading the run from **Run History** shows exactly the cases it was evaluated on even if the test set or documents changed later. Deleting a document removes the test cases (and their evidence) that cite it; "Delete all my data" removes test sets, cases and evidence.
+
+### Acceptance checklist
+
+- [x] User can upload a valid test set; invalid rows give clear errors (per-row messages in the preview; `tests/test_test_sets.py::TestValidation`).
+- [x] All strategies run on the same snapshot and are compared with identical metrics (`TestBenchmarkOnTestSet::test_all_strategies_see_identical_cases_and_snapshot_is_immutable`).
+- [x] Recall/MRR/nDCG are computed from evidence matching, not chunk IDs (`utils/evaluator.match_retrieved_chunks`; `TestMatching`, `TestMetrics`).
+- [x] Every score can be traced to retrieved chunks and gold evidence in the UI (Evidence View; `get_evidence_view` tested in `test_metrics_failure_labels_and_evidence_view`).
+- [x] Unanswerable cases are supported and reported separately (abstention rates; excluded from retrieval metrics).
+- [x] Confidence intervals shown; "not enough data" shown for tiny test sets (`bootstrap_ci`, `format_ci`, Limitations box).
+- [x] Cross-user access is impossible (tested: foreign documents rejected on upload, test sets and runs scoped by `user_id`); tests pass offline.
+
+---
+
 ## Bring your own API key, and automatic model fallback
 
 Two ways to run the LLM side:
@@ -180,10 +257,10 @@ The header is used for that request only. Key problems come back as HTTP 400 wit
 | Session handling | Session-state caches (benchmark reports, study guide, inspector state) are purged whenever the signed-in user changes in a browser tab, so one account can never see another's cached results. |
 | Upload security | Extension whitelist, size cap (`MAX_UPLOAD_SIZE_MB`, enforced while streaming), magic-byte check, path-traversal-safe random filenames, owner-only (`0700`/`0600`) per-user temp directory, file deleted after parsing. Duplicates are detected by content hash. |
 | URL ingestion (SSRF) | The URL and **every redirect hop** are resolved and checked against loopback, private, link-local, multicast, reserved and `.localhost` ranges; literal IPs are judged directly. Only text/HTML content types are accepted and the body is capped at `MAX_URL_FETCH_BYTES`. |
-| Quotas | Per-user caps on documents, total chunks, queries per day and benchmarks per day (server-side, in `utils/documents.py`). FastAPI also rate-limits by IP. |
+| Quotas | Per-user caps on documents, total chunks, queries per day, benchmarks per day (server-side, in `utils/documents.py`) and on test sets (file size, rows, sets per user). FastAPI also rate-limits by IP. |
 | External data disclosure | Document text, questions and answers are sent to the NVIDIA API. A notice is shown in the sidebar and above ingestion. Embeddings are computed locally. |
 | User API keys | Kept in Streamlit session state only (purged on user change or sign-out); API header keys are per request. Cache and reports hold a SHA-256 fingerprint or the last four characters, never the key. |
-| Complete deletion | Per-document delete and "Delete all my data" (index, documents, eval items, chats, runs, usage). |
+| Complete deletion | Per-document delete (chunks, eval items, test cases citing it) and "Delete all my data" (index, documents, eval items, test sets, chats, runs, usage). |
 | Logging | Logs record user ids and counts, never document text, passwords or API keys. |
 
 Known gaps: DNS rebinding between the check and the fetch is not prevented; there is no admin role or audit log; SQLite is single-node.
@@ -251,6 +328,7 @@ python -m pytest tests/ -q
 | `test_ingestion_security.py` | SSRF guard incl. redirects and DNS-to-private, content type and size caps, upload validation, private storage permissions |
 | `test_api_keys.py` | Key validation and fingerprinting, probe cache, auto model switch (404/410/403, not 401), benchmark records switches without the key, per-request API header |
 | `test_evaluation.py` | Cross-model generation + dedup, ground-truth import, usage/cost tracking, judge independence, failure classification, benchmark runner |
+| `test_test_sets.py` | Chunk origin at ingest, test-set upload validation (schema, evidence rules, foreign documents, size/row caps, duplicates), evidence matching across chunk sizes, hand-computed metrics, abstention, bootstrap CI, identical snapshot per strategy, cascade deletion, evidence view data, cross-user isolation |
 
 All tests run offline: the vector store, HTTP and LLM calls are mocked.
 
@@ -259,8 +337,8 @@ All tests run offline: the vector store, HTTP and LLM calls are mocked.
 ## Reproducible experiment workflow
 
 1. **Ingest** a document with "Generate eval dataset after ingest" (uses every model in `EVAL_GENERATOR_MODELS`).
-2. **Review**: Benchmark → Ground Truth. Tick items you have verified, delete bad ones, or import a JSON ground-truth file.
-3. **Run**: choose K, pipelines, "Human-reviewed items only" and optionally LLM-judge metrics. The same settings apply to every pipeline.
+2. **Review**: Benchmark → Ground Truth. Tick items you have verified, delete bad ones, or import a JSON ground-truth file. Or upload your own test cases under Benchmark → Test Sets.
+3. **Run**: choose the dataset (eval queries or a test set), K, pipelines, "Human-reviewed items only" and optionally LLM-judge metrics. The same settings apply to every pipeline.
 4. **Read the Limitations box** above the results table before interpreting numbers.
 5. **Diagnose** with the failure breakdown and Query Inspector.
 6. **Save/share**: download the JSON report; the run is also stored under Run History with its configuration and dataset fingerprint so it can be repeated.
@@ -292,7 +370,8 @@ Ragvexa/
 │   ├── memory.py           # Per-user chat history
 │   ├── rate_limit.py       # API rate limiting
 │   ├── routing.py          # FastAPI routes (JWT, ownership, quotas)
-│   └── security.py         # SSRF guard, upload validation, private storage
+│   ├── security.py         # SSRF guard, upload validation, private storage
+│   └── test_sets.py        # User test sets: CSV/JSON import, validation, snapshots, cascade delete
 ├── tests/
 ├── scripts/
 │   └── check_models.py     # Verify the NVIDIA key can invoke configured models
