@@ -311,11 +311,16 @@ def _show_switch(llm_or_call) -> None:
         )
 
 
-def _ingest_chunks(chunks, source, doc_hash, kind, size_bytes):
-    """Quota check → vector store → ownership row. Returns chunk count."""
+def _ingest_chunks(chunks, source, doc_hash, kind, size_bytes, documents=None):
+    """Quota check → ownership row → vector store (chunks carry the document id,
+    page range and char offsets). Returns chunk count."""
     check_ingest_quota(user_id, len(chunks))
-    n = add_to_vector_store(chunks, user_id=user_id, source=source)
-    register_document(user_id, source, doc_hash, kind, n, size_bytes)
+    doc_id = register_document(user_id, source, doc_hash, kind, len(chunks), size_bytes)
+    try:
+        n = add_to_vector_store(chunks, user_id=user_id, source=source, document_id=doc_id, documents=documents)
+    except Exception:
+        delete_document(user_id, doc_id)  # no ownership row without its chunks
+        raise
     record_usage(user_id, "ingest")
     return n
 
@@ -520,7 +525,7 @@ with main_tab1:
                                 if docs:
                                     chunks = chunk_documents(docs)
                                     source = os.path.basename(uploaded_file.name)[:200]
-                                    n = _ingest_chunks(chunks, source, dh, "file", len(data))
+                                    n = _ingest_chunks(chunks, source, dh, "file", len(data), documents=docs)
                                     st.success(f"✅ {n} chunks ingested from **{source}**")
 
                                     if gen_eval:
@@ -563,7 +568,7 @@ with main_tab1:
                                     st.info("ℹ️ This page is already in your index.")
                                 else:
                                     source = url_input.strip()[:200]
-                                    n = _ingest_chunks(chunks, source, url_hash, "url", 0)
+                                    n = _ingest_chunks(chunks, source, url_hash, "url", 0, documents=docs)
                                     st.success(f"✅ {n} chunks ingested from URL")
 
                                     if gen_eval_url:

@@ -1,4 +1,6 @@
 import hashlib
+import re
+
 from langchain_chroma import Chroma
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from config import CHROMA_DB_DIR
@@ -45,11 +47,99 @@ def chunk_id_for(text: str) -> str:
     return hashlib.md5(text.encode()).hexdigest()[:12]
 
 
-def add_to_vector_store(chunks, user_id: int, source: str | None = None) -> int:
+def normalise_document_text(text: str) -> str:
+    """Whitespace-normalised text: the coordinate system for char offsets."""
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def _page_number(meta: dict):
+    """1-based page number from loader metadata (PyPDFLoader stores 0-based `page`)."""
+    if not meta:
+        return None
+    page = meta.get("page")
+    if isinstance(page, bool) or not isinstance(page, int):
+        return None
+    return page + 1
+
+
+def annotate_chunk_origins(chunks, documents, document_id: int | None = None) -> int:
+    """
+    Record where each chunk came from so evidence matching can work across
+    chunking strategies: document_id, page_start/page_end (PDF only) and
+    char_start/char_end, offsets in the whitespace-normalised text of the
+    whole document (pages joined in order by a single space).
+
+    `documents` are the loader output the chunks were split from, in order.
+    Keys whose value would be null (pages of TXT/URL sources, offsets of a
+    chunk that cannot be located) are left out because Chroma rejects None
+    metadata values; readers treat a missing key as null.
+    Returns the number of chunks for which offsets were found.
+    """
+    pages = []        # (start_offset, end_offset, page_number)
+    parts = []
+    cursor_total = 0
+    for doc in documents or []:
+        norm = normalise_document_text(getattr(doc, "page_content", "") or "")
+        if not norm:
+            continue
+        if parts:
+            cursor_total += 1  # the joining space
+        pages.append((cursor_total, cursor_total + len(norm), _page_number(getattr(doc, "metadata", None))))
+        parts.append(norm)
+        cursor_total += len(norm)
+    full_text = " ".join(parts)
+
+    located = 0
+    search_from = 0
+    for chunk in chunks:
+        if not chunk.metadata:
+            chunk.metadata = {}
+        meta = chunk.metadata
+        for key in ("page_start", "page_end", "char_start", "char_end"):
+            meta.pop(key, None)
+        if document_id is not None:
+            meta["document_id"] = int(document_id)
+
+        needle = normalise_document_text(chunk.page_content)
+        start = -1
+        if needle and full_text:
+            start = full_text.find(needle, search_from)
+            if start < 0:
+                start = full_text.find(needle)
+        if start >= 0:
+            end = start + len(needle)
+            meta["char_start"] = start
+            meta["char_end"] = end
+            search_from = start
+            located += 1
+            page_nums = [p for (ps, pe, p) in pages if p is not None and ps < end and pe > start]
+            if page_nums:
+                meta["page_start"] = min(page_nums)
+                meta["page_end"] = max(page_nums)
+        else:
+            # Fall back to the loader's own page metadata when the text was not found.
+            page = _page_number(meta)
+            if page is not None:
+                meta["page_start"] = meta["page_end"] = page
+    return located
+
+
+def add_to_vector_store(
+    chunks,
+    user_id: int,
+    source: str | None = None,
+    document_id: int | None = None,
+    documents=None,
+) -> int:
     """Add chunks to the vector store tagged with the owner's user_id.
-    Returns number of chunks added."""
+
+    When `documents` (the loader output the chunks were split from) is given,
+    each chunk also records its origin: document_id, page range and character
+    offsets (see annotate_chunk_origins). Returns number of chunks added."""
     tenant_filter(user_id)  # validates user_id
     vector_store = get_vector_store()
+    if documents is not None or document_id is not None:
+        annotate_chunk_origins(chunks, documents or [], document_id)
     for chunk in chunks:
         if not chunk.metadata:
             chunk.metadata = {}

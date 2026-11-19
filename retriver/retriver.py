@@ -30,6 +30,12 @@ class RetrievedChunk:
     score: float         # higher = more relevant (0-1 range where possible)
     rank: int            # 1-based rank within this pipeline's result list
     pipeline: str        # which pipeline produced this result
+    # Origin (recorded at ingest; None for chunks indexed before this was added)
+    document_id: Optional[int] = None
+    page_start: Optional[int] = None   # 1-based, PDF only
+    page_end: Optional[int] = None
+    char_start: Optional[int] = None   # offsets in the normalised document text
+    char_end: Optional[int] = None
 
 @dataclass
 class PipelineResult:
@@ -44,6 +50,15 @@ class PipelineResult:
 # Internal helpers
 # ─────────────────────────────────────────────
 
+def _int_or_none(value) -> Optional[int]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _doc_to_chunk(doc: Document, rank: int, score: float, pipeline: str) -> RetrievedChunk:
     meta = doc.metadata or {}
     return RetrievedChunk(
@@ -53,6 +68,11 @@ def _doc_to_chunk(doc: Document, rank: int, score: float, pipeline: str) -> Retr
         score=round(float(score), 4),
         rank=rank,
         pipeline=pipeline,
+        document_id=_int_or_none(meta.get("document_id")),
+        page_start=_int_or_none(meta.get("page_start")),
+        page_end=_int_or_none(meta.get("page_end")),
+        char_start=_int_or_none(meta.get("char_start")),
+        char_end=_int_or_none(meta.get("char_end")),
     )
 
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:

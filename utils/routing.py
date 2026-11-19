@@ -181,8 +181,12 @@ async def upload_document(
             raise HTTPException(status_code=429, detail=str(e))
 
         source = os.path.basename(filename)[:200]
-        n = add_to_vector_store(chunks, user_id=user_id, source=source)
-        doc_id = register_document(user_id, source, doc_hash, "file", n, size)
+        doc_id = register_document(user_id, source, doc_hash, "file", len(chunks), size)
+        try:
+            n = add_to_vector_store(chunks, user_id=user_id, source=source, document_id=doc_id, documents=documents)
+        except Exception:
+            delete_document(user_id, doc_id)  # no ownership row without its chunks
+            raise
         record_usage(user_id, "ingest")
         return {"message": "Document processed and stored successfully", "document_id": doc_id, "chunks": n}
     except HTTPException:
@@ -214,8 +218,12 @@ async def ingest_url(
         except QuotaExceeded as e:
             raise HTTPException(status_code=429, detail=str(e))
         source = body.url[:200]
-        n = add_to_vector_store(chunks, user_id=user_id, source=source)
-        doc_id = register_document(user_id, source, doc_hash, "url", n, 0)
+        doc_id = register_document(user_id, source, doc_hash, "url", len(chunks), 0)
+        try:
+            n = add_to_vector_store(chunks, user_id=user_id, source=source, document_id=doc_id, documents=documents)
+        except Exception:
+            delete_document(user_id, doc_id)  # no ownership row without its chunks
+            raise
         record_usage(user_id, "ingest")
         return {"message": "URL content processed and stored successfully", "document_id": doc_id, "chunks": n}
     except HTTPException:
