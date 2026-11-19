@@ -61,6 +61,7 @@ _CSV_COLUMNS = {
 
 class TestSetError(ValueError):
     """A whole-file problem (format, size, quota); row problems go in the preview."""
+    __test__ = False  # keep pytest from collecting it when imported into tests
 
 
 # ─────────────────────────────────────────────
