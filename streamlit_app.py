@@ -36,6 +36,20 @@ from utils.benchmark import (
     list_runs,
     load_run,
     FAILURE_CATEGORIES,
+    is_test_set_report,
+    get_test_set_summary_table,
+    get_tag_breakdown_table,
+    get_evidence_rows,
+    get_evidence_view,
+)
+from utils.test_sets import (
+    TestSetError,
+    parse_test_set_file,
+    validate_test_set,
+    save_test_set,
+    list_test_sets,
+    delete_test_set,
+    rows_to_csv,
 )
 from utils.documents import (
     QuotaExceeded,
@@ -68,6 +82,10 @@ from config import (
     MAX_QUESTION_CHARS,
     MAX_UPLOAD_SIZE_MB,
     NVIDIA_API_KEY,
+    EVIDENCE_OVERLAP_THRESHOLD,
+    MAX_TEST_SET_MB,
+    MAX_TEST_SET_ROWS,
+    MIN_CASES_FOR_CI,
 )
 
 from PIL import Image
@@ -444,17 +462,19 @@ with st.sidebar:
     for d in my_docs:
         c1, c2 = st.columns([4, 1])
         c1.caption(f"{'🌐' if d.kind == 'url' else '📄'} {d.source[:40]} · {d.chunk_count} chunks")
-        if c2.button("🗑", key=f"del_doc_{d.id}", help="Delete this document, its chunks and its eval items"):
+        if c2.button("🗑", key=f"del_doc_{d.id}", help="Delete this document, its chunks, its eval items and test cases citing it"):
             try:
                 removed = delete_document(user_id, d.id)
                 st.session_state.pop("benchmark_report", None)
-                st.toast(f"Deleted {d.source[:30]} ({removed['chunks']} chunks, {removed['eval_items']} eval items)")
+                st.session_state.pop("ts_preview", None)
+                st.toast(f"Deleted {d.source[:30]} ({removed['chunks']} chunks, {removed['eval_items']} eval items, "
+                         f"{removed.get('test_cases', 0)} test cases)")
                 st.rerun()
             except Exception as e:
                 st.error(f"Could not delete: {e}")
 
     with st.expander("⚠️ Delete all my data"):
-        st.caption("Removes your index, documents, eval datasets, chat history, benchmark runs and usage log.")
+        st.caption("Removes your index, documents, eval datasets, test sets, chat history, benchmark runs and usage log.")
         confirm = st.checkbox("I understand this cannot be undone", key="confirm_wipe")
         if st.button("Delete everything", type="primary", disabled=not confirm, key="wipe_btn"):
             counts = delete_all_user_data(user_id)
@@ -729,7 +749,95 @@ with main_tab2:
     reviewed_q = stats.get("reviewed_unique_queries", 0)
     sources = stats.get("sources", {})
 
-    bench_tab_run, bench_tab_gt, bench_tab_hist = st.tabs(["▶ Run", "✅ Ground Truth", "🗂 Run History"])
+    my_test_sets = list_test_sets(user_id)
+    bench_tab_run, bench_tab_gt, bench_tab_ts, bench_tab_hist = st.tabs(
+        ["▶ Run", "✅ Ground Truth", "🧾 Test Sets", "🗂 Run History"]
+    )
+
+    # ── Test Sets tab ────────────────────────────────────────────
+    with bench_tab_ts:
+        st.markdown("### 🧾 Your Test Sets")
+        st.caption(
+            "Upload your own questions with the evidence that answers them. Every strategy is then run on the "
+            "same cases and each score can be traced back to the retrieved chunks and your gold evidence. "
+            "Unanswerable questions (answerable=false, no evidence) test whether the system abstains."
+        )
+        with st.expander("File format (CSV or JSON)", expanded=not my_test_sets):
+            st.markdown(
+                f"""
+| Field | Required | Meaning |
+|---|---|---|
+| `question` | yes | The user question |
+| `expected_answer` | no | Reference answer (enables correctness scoring) |
+| `answerable` | yes | `true` / `false`; `false` = the answer is not in your documents |
+| `gold_evidence` | if answerable | List of `{{"document": "policy.pdf", "pages": [4], "passage": "exact text"}}` |
+| `tags` | no | Labels such as `table`, `multi-hop` for per-tag breakdowns |
+
+CSV: put `gold_evidence` as a JSON string, or use the columns `evidence_document`, `evidence_pages`,
+`evidence_passage` for a single evidence item. `document` must be one of **your** uploaded documents;
+passages are checked against the document text on upload. Limits: {MAX_TEST_SET_MB} MB, {MAX_TEST_SET_ROWS} rows.
+"""
+            )
+            st.code(
+                '[\n  {"question": "What is the refund window?", "expected_answer": "30 days from purchase.",\n'
+                '   "answerable": true, "tags": ["policy"],\n'
+                '   "gold_evidence": [{"document": "policy.pdf", "pages": [4],\n'
+                '                      "passage": "Refunds are accepted within 30 days of purchase."}]},\n'
+                '  {"question": "Who is the CEO?", "answerable": false}\n]',
+                language="json",
+            )
+
+        ts_file = st.file_uploader("Test cases (CSV or JSON)", type=["csv", "json"], key="ts_upload")
+        ts_name = st.text_input("Test set name", value=(ts_file.name.rsplit(".", 1)[0][:60] if ts_file else ""),
+                                max_chars=100, key="ts_name")
+        if ts_file and st.button("🔍 Validate", key="ts_validate_btn", type="primary"):
+            try:
+                rows = parse_test_set_file(ts_file.name, ts_file.getvalue())
+                with st.spinner("Checking documents and passages…"):
+                    preview = validate_test_set(user_id, rows, source_name=ts_file.name[:100])
+                st.session_state["ts_preview"] = preview
+            except TestSetError as e:
+                st.session_state.pop("ts_preview", None)
+                st.error(f"{e}")
+            except Exception as e:
+                st.session_state.pop("ts_preview", None)
+                st.error(f"Could not read the file: {e}")
+
+        preview = st.session_state.get("ts_preview")
+        if preview is not None:
+            st.markdown(f"#### Preview — {preview.valid_rows} valid, {preview.error_rows} with errors "
+                        f"(of {preview.total_rows})")
+            if preview.error_rows:
+                st.error("Rows with errors are listed below. Fix the file and validate again, or save only the valid rows.")
+            else:
+                st.success("All rows are valid.")
+            st.dataframe(pd.DataFrame(preview.as_table()), hide_index=True, use_container_width=True, height=300)
+            sc1, sc2 = st.columns([1, 1])
+            skip_invalid = sc1.checkbox("Save only the valid rows", value=False, key="ts_skip_invalid",
+                                        disabled=(preview.error_rows == 0))
+            can_save = preview.valid_rows > 0 and (preview.error_rows == 0 or skip_invalid)
+            if sc2.button("💾 Save test set", key="ts_save_btn", disabled=not can_save, use_container_width=True):
+                try:
+                    new_id = save_test_set(user_id, ts_name, preview, skip_invalid=skip_invalid)
+                    st.session_state.pop("ts_preview", None)
+                    st.success(f"Saved test set #{new_id}. Pick it under Run → Dataset.")
+                    st.rerun()
+                except TestSetError as e:
+                    st.error(f"{e}")
+
+        st.divider()
+        if my_test_sets:
+            st.markdown("#### Saved test sets")
+            st.dataframe(pd.DataFrame(my_test_sets), hide_index=True, use_container_width=True)
+            dc1, dc2 = st.columns([2, 1])
+            ts_del = dc1.selectbox("Delete a test set", [f"#{t['id']} {t['name']}" for t in my_test_sets], key="ts_del_pick")
+            if dc2.button("🗑 Delete", key="ts_del_btn", use_container_width=True):
+                del_id = int(ts_del.split(" ", 1)[0][1:])
+                n = delete_test_set(user_id, del_id)
+                st.toast(f"Deleted test set #{del_id} ({n} cases)")
+                st.rerun()
+        else:
+            st.info("No test sets yet. Upload documents first, then a CSV/JSON of test cases.")
 
     # ── Ground Truth tab ─────────────────────────────────────────
     with bench_tab_gt:
@@ -837,18 +945,44 @@ with main_tab2:
             st.divider()
 
             st.markdown("### ⚙️ Benchmark Settings")
+            dataset_options = ["Eval queries (synthetic / ground truth)"] + [
+                f"Test set #{t['id']}: {t['name']} ({t['cases']} cases)" for t in my_test_sets
+            ]
+            dataset_choice = st.selectbox(
+                "Dataset",
+                dataset_options,
+                key="bench_dataset",
+                help="A test set runs every strategy on an immutable snapshot of your own cases and scores "
+                     "retrieval by matching chunks to your gold evidence (not chunk ids).",
+            )
+            chosen_test_set = None
+            if dataset_choice != dataset_options[0]:
+                chosen_test_set = my_test_sets[dataset_options.index(dataset_choice) - 1]
             k_val = st.slider("Top-K retrieved documents", min_value=1, max_value=10, value=5)
             selected_pipelines = st.multiselect(
                 "Pipelines to evaluate:",
                 PIPELINE_NAMES,
                 default=PIPELINE_NAMES,
             )
-            reviewed_only = st.checkbox(
-                "Human-reviewed items only",
-                value=False,
-                disabled=(reviewed_q == 0),
-                help="Restrict the dataset to items you marked as reviewed in the Ground Truth tab.",
-            )
+            reviewed_only = False
+            overlap_threshold = EVIDENCE_OVERLAP_THRESHOLD
+            if chosen_test_set is None:
+                reviewed_only = st.checkbox(
+                    "Human-reviewed items only",
+                    value=False,
+                    disabled=(reviewed_q == 0),
+                    help="Restrict the dataset to items you marked as reviewed in the Ground Truth tab.",
+                )
+            else:
+                overlap_threshold = st.slider(
+                    "Evidence overlap threshold", min_value=0.1, max_value=1.0, value=float(EVIDENCE_OVERLAP_THRESHOLD), step=0.05,
+                    help="Fraction of a gold passage's tokens that must appear in a retrieved chunk for it to count as a hit.",
+                )
+                st.caption(
+                    f"{chosen_test_set['answerable']} answerable · {chosen_test_set['unanswerable']} unanswerable cases. "
+                    f"Confidence intervals need at least {MIN_CASES_FOR_CI} cases. "
+                    "Enable LLM-judge metrics to measure abstention and answer quality."
+                )
             bench_settings = _llm_settings()
             include_llm = st.checkbox(
                 "Include LLM-judge metrics",
@@ -866,7 +1000,10 @@ with main_tab2:
                 f"answer `{bench_settings['answer_model'].split('/')[-1]}` · judge `{bench_settings['judge_model'].split('/')[-1]}`"
             )
 
-            effective_q = reviewed_q if reviewed_only else unique_q
+            if chosen_test_set is not None:
+                effective_q = chosen_test_set["cases"]
+            else:
+                effective_q = reviewed_q if reviewed_only else unique_q
             run_btn = st.button(
                 "▶ Run Benchmark",
                 type="primary",
@@ -875,13 +1012,13 @@ with main_tab2:
             )
 
         with bm_col2:
-            if total_q == 0:
+            if total_q == 0 and not my_test_sets:
                 st.markdown("""
                 <div style='background:#FFFFFF;border:1px dashed #C7D3B4;border-radius:12px;
                             padding:3rem;text-align:center;'>
                     <p style='font-size:2rem;'>🌿</p>
                     <p style='color:#8A9B7D;'>
-                        Ingest documents and generate an eval dataset to unlock benchmarking.
+                        Ingest documents, then generate an eval dataset or upload a test set to unlock benchmarking.
                     </p>
                 </div>
                 """, unsafe_allow_html=True)
@@ -909,6 +1046,8 @@ with main_tab2:
                         api_key=bench_settings["api_key"],
                         answer_model=bench_settings["answer_model"],
                         judge_model=bench_settings["judge_model"],
+                        test_set_id=chosen_test_set["id"] if chosen_test_set else None,
+                        overlap_threshold=overlap_threshold if chosen_test_set else None,
                     )
                     st.session_state["benchmark_report"] = report
                     progress_bar.progress(100, text="✅ Benchmark complete")
@@ -942,6 +1081,176 @@ with main_tab2:
             if limitations:
                 st.warning("**Limitations**\n\n" + "\n".join(f"- {n}" for n in limitations))
 
+        if report and report.total_queries > 0 and is_test_set_report(report):
+            # ═══ Evidence-based results (user test set) ═══
+            st.markdown(f"#### Strategies × metrics on test set **{cfg.get('test_set_name')}** "
+                        f"(snapshot `{cfg.get('test_set_fingerprint')}`, threshold {cfg.get('overlap_threshold')})")
+            st.caption(
+                "Retrieval metrics are over answerable cases and computed by matching retrieved chunks to your gold "
+                "evidence (same document, page overlap, passage token overlap). Brackets are bootstrap 95% confidence "
+                f"intervals over cases; below {cfg.get('min_cases_for_ci', MIN_CASES_FOR_CI)} cases they are not reported. "
+                "Abstention rates are over unanswerable cases and need generated answers."
+            )
+            ts_summary = get_test_set_summary_table(report)
+            st.dataframe(pd.DataFrame(ts_summary), hide_index=True, use_container_width=True)
+
+            tcol1, tcol2 = st.columns(2)
+            with tcol1:
+                st.markdown(f"##### Recall@{report.k} (mean)")
+                st.bar_chart({p: (report.per_pipeline[p].get("recall_at_k") or 0.0) for p in report.pipelines},
+                             y_label="Recall", use_container_width=True)
+            with tcol2:
+                st.markdown("##### Correct abstention rate")
+                ab_data = {p: ((report.per_pipeline[p].get("abstention") or {}).get("correct_abstention_rate") or 0.0)
+                           for p in report.pipelines}
+                if any((report.per_pipeline[p].get("abstention") or {}).get("n") for p in report.pipelines):
+                    st.bar_chart(ab_data, y_label="rate", use_container_width=True)
+                else:
+                    st.caption("No unanswerable cases were judged (enable LLM-judge metrics).")
+
+            tag_rows = get_tag_breakdown_table(report)
+            if tag_rows:
+                st.markdown("##### Breakdown by tag (answerable cases)")
+                st.dataframe(pd.DataFrame(tag_rows), hide_index=True, use_container_width=True)
+
+            st.markdown("##### 🧭 Failure breakdown by stage")
+            st.caption(
+                "missing_evidence: the gold document has no chunks in the index · retrieval: evidence indexed but not "
+                "in the wider candidate pool · ranking: in the pool but outside top-K · generation: evidence retrieved "
+                "but the judged answer scored below 0.5, or the system answered an unanswerable question · ok: otherwise."
+            )
+            st.dataframe(pd.DataFrame(get_failure_breakdown(report)), hide_index=True, use_container_width=True)
+
+            # ── Evidence view ────────────────────────────────────
+            st.divider()
+            st.markdown("### 🔎 Evidence View")
+            st.markdown(
+                "<p style='color:#8A9B7D;font-size:0.88rem;'>For every test case and strategy: the retrieved chunks "
+                "in rank order with hit/miss marks against your gold evidence, the gold evidence itself, the generated "
+                "answer with judge verdicts, and the failure label.</p>",
+                unsafe_allow_html=True,
+            )
+            all_tags = sorted({t for r in report.per_query for t in (r.get("tags") or [])})
+            fc1, fc2, fc3 = st.columns([1, 1, 1])
+            failed_only = fc1.checkbox("Failed cases only", value=False, key="ev_failed_only")
+            tag_filter = fc2.selectbox("Tag", ["(all)"] + all_tags, key="ev_tag") if all_tags else None
+            pipe_filter = fc3.selectbox("Strategy", ["(all)"] + list(report.pipelines), key="ev_pipe")
+            ev_rows = get_evidence_rows(
+                report,
+                failed_only=failed_only,
+                tag=None if tag_filter in (None, "(all)") else tag_filter,
+                pipeline=None if pipe_filter == "(all)" else pipe_filter,
+            )
+            st.download_button(
+                "⬇️ Download filtered rows (CSV)",
+                data=rows_to_csv([
+                    {
+                        "case_id": r.get("case_id"), "question": r.get("query"), "pipeline": r.get("pipeline"),
+                        "answerable": r.get("answerable"), "tags": ",".join(r.get("tags") or []),
+                        "hit_rate_at_k": r.get("hit_rate_at_k"), "recall_at_k": r.get("recall_at_k"),
+                        "mrr": r.get("mrr"), "ndcg_at_k": r.get("ndcg_at_k"), "coarse_match": r.get("coarse_match"),
+                        "abstained": r.get("abstained"), "failure_category": r.get("failure_category"),
+                        "answer_faithfulness": r.get("answer_faithfulness"), "answer_correctness": r.get("answer_correctness"),
+                        "answer": r.get("answer"),
+                    }
+                    for r in ev_rows
+                ]),
+                file_name=f"ragvexa_evidence_{cfg.get('test_set_fingerprint', 'run')}.csv",
+                mime="text/csv",
+                disabled=not ev_rows,
+            )
+            case_options = []
+            seen_cases = set()
+            for r in ev_rows:
+                if r.get("case_id") not in seen_cases:
+                    seen_cases.add(r.get("case_id"))
+                    marker = "❌" if r.get("failure_category") != "ok" else "✅"
+                    case_options.append((r.get("case_id"), f"{marker} #{r.get('case_id')} {r.get('query')[:90]}"))
+            if not case_options:
+                st.info("No cases match the current filters.")
+            else:
+                pick_label = st.selectbox("Test case", [lbl for _, lbl in case_options], key="ev_case")
+                pick_id = next(cid for cid, lbl in case_options if lbl == pick_label)
+                view = get_evidence_view(report, pick_id)
+                left_col, right_col = st.columns([1, 2])
+                with left_col:
+                    st.markdown("**Question**")
+                    st.markdown(f"> {view['question']}")
+                    st.caption(
+                        ("Answerable" if view["answerable"] else "Unanswerable (expects abstention)")
+                        + (" · tags: " + ", ".join(view["tags"]) if view["tags"] else "")
+                    )
+                    if view.get("expected_answer"):
+                        st.markdown("**Expected answer**")
+                        st.markdown(f"> {view['expected_answer'][:800]}")
+                    st.markdown("**Gold evidence**")
+                    if not view["gold_evidence"]:
+                        st.caption("None (unanswerable case).")
+                    for gi, g in enumerate(view["gold_evidence"], start=1):
+                        pages = ""
+                        if g.get("page_start"):
+                            pages = f" p.{g['page_start']}" + (f"-{g['page_end']}" if g.get("page_end") and g["page_end"] != g["page_start"] else "")
+                        st.markdown(f"**gold {gi}** — `{g.get('document')}`{pages}")
+                        if g.get("passage"):
+                            st.markdown(f"> {g['passage'][:600]}")
+                        else:
+                            st.caption("No passage: matched on document/page only (coarse).")
+                with right_col:
+                    for pr in view["per_pipeline"]:
+                        if pipe_filter != "(all)" and pr["pipeline"] != pipe_filter:
+                            continue
+                        cat = pr.get("failure_category", "—")
+                        ok = cat == "ok"
+                        color = "#EEF4E6" if ok else "#FFF0F0"
+                        if view["answerable"]:
+                            metric_bits = (
+                                f"&nbsp; Hit@{report.k}: <code>{pr.get('hit_rate_at_k') or 0:.0f}</code>"
+                                f"&nbsp; Recall@{report.k}: <code>{pr.get('recall_at_k') or 0:.3f}</code>"
+                                f"&nbsp; MRR: <code>{pr.get('mrr') or 0:.3f}</code>"
+                                f"&nbsp; nDCG@{report.k}: <code>{pr.get('ndcg_at_k') or 0:.3f}</code>"
+                                + ("&nbsp; <em>coarse match</em>" if pr.get("coarse_match") else "")
+                            )
+                        else:
+                            ab = pr.get("abstained")
+                            metric_bits = "&nbsp; abstained: <code>" + ("not judged" if ab is None else ("yes" if ab else "no — false answer")) + "</code>"
+                        st.markdown(
+                            f"""<div style='background:{color};border:1px solid #E6E2D8;
+                                            border-radius:10px;padding:0.75rem 1rem;margin-bottom:0.75rem;'>
+                                <strong>{pr['pipeline']}</strong>{metric_bits}
+                                &nbsp; stage: <code>{cat}</code>
+                            </div>""",
+                            unsafe_allow_html=True,
+                        )
+                        if pr.get("rewritten_query"):
+                            st.caption(f"Rewritten query: *{pr['rewritten_query']}*")
+                        for chunk in pr.get("retrieved_chunks", []):
+                            icon = "✅" if chunk.get("hit") else "❌"
+                            page_txt = f" p.{chunk['page_start']}" if chunk.get("page_start") else ""
+                            if chunk.get("page_end") and chunk.get("page_end") != chunk.get("page_start"):
+                                page_txt += f"-{chunk['page_end']}"
+                            matched = f" → **{chunk['matched_gold_label']}**" if chunk.get("matched_gold_label") else ""
+                            coarse_txt = " *(coarse)*" if chunk.get("coarse") else ""
+                            st.markdown(
+                                f"{icon} **Rank {chunk['rank']}** — `{chunk['source']}`{page_txt} "
+                                f"| score `{chunk['score']:.4f}`{matched}{coarse_txt}"
+                            )
+                            st.caption(chunk.get("reason") or "")
+                            st.markdown(f"> {chunk.get('text', '')[:300]}{'…' if len(chunk.get('text', '')) >= 300 else ''}")
+                        if pr.get("answer") is not None:
+                            with st.expander(f"Answer and judge verdicts ({pr['pipeline']})"):
+                                st.markdown(pr["answer"] or "*(empty answer)*")
+                                def _v(x):
+                                    return f"{x:.2f}" if isinstance(x, (int, float)) else "not scored"
+                                st.caption(
+                                    f"faithfulness {_v(pr.get('answer_faithfulness'))} · groundedness {_v(pr.get('answer_groundedness'))} · "
+                                    f"relevance {_v(pr.get('answer_relevance'))} · correctness {_v(pr.get('answer_correctness'))}"
+                                    + (" · abstained" if pr.get("abstained") else "")
+                                )
+                        if pr.get("error"):
+                            st.warning(f"⚠️ {pr['error']}")
+
+        elif report and report.total_queries > 0:
+            # ═══ Chunk-id results (eval queries) ═══
             # Summary table
             summary_rows = get_pipeline_summary_table(report)
             if summary_rows:
