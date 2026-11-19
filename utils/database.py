@@ -86,6 +86,41 @@ class BenchmarkRun(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+class TestSet(Base):
+    """A user-uploaded set of test cases (questions with known gold evidence)."""
+    __tablename__ = "test_sets"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
+    name = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class TestCase(Base):
+    __tablename__ = "test_cases"
+
+    id = Column(Integer, primary_key=True, index=True)
+    test_set_id = Column(Integer, ForeignKey("test_sets.id"), index=True, nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
+    question = Column(Text, nullable=False)
+    expected_answer = Column(Text, nullable=True)
+    answerable = Column(Boolean, nullable=False, default=True)
+    tags = Column(Text, nullable=True)          # JSON list of strings
+
+
+class TestCaseEvidence(Base):
+    """Where the answer to a test case lives: a document the user owns, an
+    optional page range (PDF) and an optional passage for precise matching."""
+    __tablename__ = "test_case_evidence"
+
+    id = Column(Integer, primary_key=True, index=True)
+    test_case_id = Column(Integer, ForeignKey("test_cases.id"), index=True, nullable=False)
+    document_id = Column(Integer, ForeignKey("documents.id"), index=True, nullable=False)
+    page_start = Column(Integer, nullable=True)   # 1-based, PDF only
+    page_end = Column(Integer, nullable=True)
+    passage = Column(Text, nullable=True)
+
+
 class UsageEvent(Base):
     """Per-user usage log used for daily quotas and cost reporting."""
     __tablename__ = "usage_events"
@@ -103,25 +138,43 @@ class UsageEvent(Base):
 Base.metadata.create_all(bind=engine)
 
 
+# Columns added after a table's first release: table -> {column: DDL}.
+# New tables are created by create_all; only ADD COLUMN needs a migration.
+_MIGRATIONS = {
+    "synthetic_eval": {
+        "origin": "VARCHAR DEFAULT 'synthetic'",
+        "generator_model": "VARCHAR",
+        "reference_answer": "TEXT",
+        "reviewed": "BOOLEAN DEFAULT 0",
+    },
+    "test_cases": {
+        "expected_answer": "TEXT",
+        "answerable": "BOOLEAN DEFAULT 1",
+        "tags": "TEXT",
+    },
+    "test_case_evidence": {
+        "page_start": "INTEGER",
+        "page_end": "INTEGER",
+        "passage": "TEXT",
+    },
+}
+
+
 def _migrate_sqlite_columns():
     """Add columns introduced after the first release to existing SQLite DBs.
 
     SQLite cannot ALTER a column, but ADD COLUMN is safe and idempotent here.
     """
     insp = inspect(engine)
-    if "synthetic_eval" not in insp.get_table_names():
-        return
-    existing = {c["name"] for c in insp.get_columns("synthetic_eval")}
-    wanted = {
-        "origin": "VARCHAR DEFAULT 'synthetic'",
-        "generator_model": "VARCHAR",
-        "reference_answer": "TEXT",
-        "reviewed": "BOOLEAN DEFAULT 0",
-    }
+    tables = set(insp.get_table_names())
     with engine.begin() as conn:
-        for col, ddl in wanted.items():
-            if col not in existing:
-                conn.execute(text(f"ALTER TABLE synthetic_eval ADD COLUMN {col} {ddl}"))
+        for table, wanted in _MIGRATIONS.items():
+            if table not in tables:
+                continue
+            existing = {c["name"] for c in insp.get_columns(table)}
+            for col, ddl in wanted.items():
+                if col not in existing:
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}"))
 
 
 _migrate_sqlite_columns()

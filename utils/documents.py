@@ -266,6 +266,8 @@ def delete_document(user_id: int, document_id: int) -> dict:
     doc = get_owned_document(user_id, document_id)  # raises NotOwner otherwise
     removed_chunks = delete_user_source(user_id, doc.source)
 
+    from utils.test_sets import delete_cases_for_documents
+
     db = SessionLocal()
     try:
         removed_eval = (
@@ -273,6 +275,9 @@ def delete_document(user_id: int, document_id: int) -> dict:
             .filter(SyntheticEvalItem.user_id == user_id, SyntheticEvalItem.doc_hash == doc.doc_hash)
             .delete(synchronize_session=False)
         )
+        # Test cases whose gold evidence cites this document cannot be
+        # evaluated any more: remove them with all their evidence.
+        removed_tests = delete_cases_for_documents(db, user_id, [doc.id])
         db.query(Document).filter(Document.id == doc.id, Document.user_id == user_id).delete(
             synchronize_session=False
         )
@@ -283,20 +288,23 @@ def delete_document(user_id: int, document_id: int) -> dict:
     finally:
         db.close()
 
-    logger.info("Deleted document id=%s for user_id=%s (chunks=%s, eval_items=%s)",
-                document_id, user_id, removed_chunks, removed_eval)
-    return {"chunks": removed_chunks, "eval_items": removed_eval}
+    logger.info("Deleted document id=%s for user_id=%s (chunks=%s, eval_items=%s, test_cases=%s)",
+                document_id, user_id, removed_chunks, removed_eval, removed_tests["test_cases"])
+    return {"chunks": removed_chunks, "eval_items": removed_eval, **removed_tests}
 
 
 def delete_all_user_data(user_id: int) -> dict:
-    """Erase everything the user owns: index, documents, eval data, chats, runs, usage."""
+    """Erase everything the user owns: index, documents, eval data, test sets, chats, runs, usage."""
     from retriver.vector_store import clear_user_index
+
+    from utils.test_sets import delete_all_test_data
 
     _require_user(user_id)
     removed_chunks = clear_user_index(user_id)
     db = SessionLocal()
     try:
         counts = {"chunks": removed_chunks}
+        counts.update(delete_all_test_data(db, user_id))
         for model, label in (
             (SyntheticEvalItem, "eval_items"),
             (Document, "documents"),

@@ -70,6 +70,16 @@ MAX_QUERIES_PER_DAY = int(os.getenv("MAX_QUERIES_PER_DAY", "200"))
 MAX_BENCHMARKS_PER_DAY = int(os.getenv("MAX_BENCHMARKS_PER_DAY", "20"))
 MAX_QUESTION_CHARS = int(os.getenv("MAX_QUESTION_CHARS", "2000"))
 
+# --- User test sets (evidence-based evaluation) ---
+MAX_TEST_SET_ROWS = int(os.getenv("MAX_TEST_SET_ROWS", "500"))
+MAX_TEST_SET_MB = int(os.getenv("MAX_TEST_SET_MB", "2"))
+MAX_TEST_SET_BYTES = MAX_TEST_SET_MB * 1024 * 1024
+MAX_TEST_SETS_PER_USER = int(os.getenv("MAX_TEST_SETS_PER_USER", "20"))
+# Fraction of a gold passage's tokens that must appear in a chunk for a hit.
+EVIDENCE_OVERLAP_THRESHOLD = float(os.getenv("EVIDENCE_OVERLAP_THRESHOLD", "0.5"))
+# Below this many test cases a bootstrap interval is reported as "not enough data".
+MIN_CASES_FOR_CI = int(os.getenv("MIN_CASES_FOR_CI", "10"))
+
 # --- URL ingestion limits ---
 MAX_URL_FETCH_BYTES = int(os.getenv("MAX_URL_FETCH_BYTES", str(5 * 1024 * 1024)))
 URL_FETCH_TIMEOUT_SECONDS = int(os.getenv("URL_FETCH_TIMEOUT_SECONDS", "15"))

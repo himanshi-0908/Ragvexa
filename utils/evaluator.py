@@ -14,6 +14,7 @@ import math
 import re
 import threading
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional
 
@@ -66,6 +67,33 @@ def ndcg_at_k(retrieved_ids: List[str], relevant_ids: List[str], k: int) -> floa
     if ideal_dcg == 0:
         return 0.0
     return round(actual_dcg / ideal_dcg, 4)
+
+
+# ─────────────────────────────────────────────
+# Text normalisation (shared by evidence matching and upload validation)
+# ─────────────────────────────────────────────
+
+_NON_ALNUM = re.compile(r"[^a-z0-9]+")
+
+
+def normalise_text(text: Optional[str]) -> str:
+    """Lowercase, punctuation and whitespace collapsed to single spaces."""
+    return _NON_ALNUM.sub(" ", (text or "").lower()).strip()
+
+
+def text_tokens(text: Optional[str]) -> List[str]:
+    return normalise_text(text).split()
+
+
+def token_overlap(gold_text: Optional[str], chunk_text: Optional[str]) -> float:
+    """Fraction of the gold passage's tokens (with multiplicity) found in the chunk."""
+    gold = Counter(text_tokens(gold_text))
+    total = sum(gold.values())
+    if total == 0:
+        return 0.0
+    chunk = Counter(text_tokens(chunk_text))
+    common = sum(min(n, chunk.get(tok, 0)) for tok, n in gold.items())
+    return round(common / total, 4)
 
 
 # ─────────────────────────────────────────────
