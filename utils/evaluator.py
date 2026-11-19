@@ -381,3 +381,248 @@ def evaluate_query(
         result.update(usage.as_dict())
 
     return result
+
+
+# ─────────────────────────────────────────────
+# Evidence matching (user test sets)
+#
+# Strategies use different chunk sizes, so a retrieved chunk is never compared
+# to gold by chunk id. It is a HIT for a gold evidence item when it comes from
+# the same document, its page range overlaps the gold pages (when both sides
+# have pages) and, if the gold item has a passage, at least
+# `overlap_threshold` of the passage's tokens are in the chunk (or the char
+# ranges overlap by that fraction). Without a passage the page/document match
+# counts, flagged as coarse.
+# ─────────────────────────────────────────────
+
+DEFAULT_OVERLAP_THRESHOLD = 0.5
+
+
+def _same_document(chunk: Dict, gold: Dict) -> bool:
+    cid, gid = chunk.get("document_id"), gold.get("document_id")
+    if cid is not None and gid is not None:
+        return int(cid) == int(gid)
+    csrc, gsrc = chunk.get("source"), gold.get("document")
+    if not csrc or not gsrc:
+        return False
+    csrc, gsrc = str(csrc).strip().lower(), str(gsrc).strip().lower()
+    return csrc == gsrc or csrc.rsplit("/", 1)[-1] == gsrc.rsplit("/", 1)[-1]
+
+
+def _pages_overlap(chunk: Dict, gold: Dict) -> Optional[bool]:
+    """True/False when both sides carry pages, None when the check does not apply."""
+    gs, ge = gold.get("page_start"), gold.get("page_end")
+    cs, ce = chunk.get("page_start"), chunk.get("page_end")
+    if gs is None or cs is None:
+        return None
+    ge = ge if ge is not None else gs
+    ce = ce if ce is not None else cs
+    return int(cs) <= int(ge) and int(ce) >= int(gs)
+
+
+def char_overlap_fraction(chunk: Dict, gold: Dict) -> Optional[float]:
+    """Fraction of the gold char range covered by the chunk; None when ranges are missing."""
+    gs, ge = gold.get("char_start"), gold.get("char_end")
+    cs, ce = chunk.get("char_start"), chunk.get("char_end")
+    if None in (gs, ge, cs, ce):
+        return None
+    gs, ge, cs, ce = int(gs), int(ge), int(cs), int(ce)
+    if ge <= gs:
+        return None
+    covered = max(0, min(ge, ce) - max(gs, cs))
+    return round(covered / (ge - gs), 4)
+
+
+def match_chunk_to_evidence(chunk: Dict, gold: Dict, overlap_threshold: float = DEFAULT_OVERLAP_THRESHOLD) -> Dict:
+    """
+    Decide whether one retrieved chunk is a hit for one gold evidence item.
+
+    chunk: {document_id, source, page_start, page_end, char_start, char_end, text}
+    gold:  {document_id, document, page_start, page_end, passage, [char_start, char_end]}
+    Returns {"hit": bool, "coarse": bool, "overlap": float, "reason": str}.
+    """
+    if not _same_document(chunk, gold):
+        return {"hit": False, "coarse": False, "overlap": 0.0, "reason": "different document"}
+    pages = _pages_overlap(chunk, gold)
+    if pages is False:
+        return {"hit": False, "coarse": False, "overlap": 0.0, "reason": "pages do not overlap"}
+
+    passage = gold.get("passage")
+    if passage and str(passage).strip():
+        tok = token_overlap(passage, chunk.get("text"))
+        chars = char_overlap_fraction(chunk, gold)
+        best = max(tok, chars or 0.0)
+        if best >= overlap_threshold:
+            how = "token overlap" if tok >= (chars or 0.0) else "char-range overlap"
+            return {"hit": True, "coarse": False, "overlap": best, "reason": f"{how} {best:.0%}"}
+        return {"hit": False, "coarse": False, "overlap": best,
+                "reason": f"text overlap {best:.0%} below threshold {overlap_threshold:.0%}"}
+
+    if pages is True:
+        return {"hit": True, "coarse": True, "overlap": 1.0, "reason": "page overlap only (no passage): coarse match"}
+    return {"hit": True, "coarse": True, "overlap": 1.0, "reason": "same document only (no pages/passage): coarse match"}
+
+
+def match_retrieved_chunks(
+    chunks: List[Dict],
+    gold_items: List[Dict],
+    k: int,
+    overlap_threshold: float = DEFAULT_OVERLAP_THRESHOLD,
+) -> Dict:
+    """
+    Match every retrieved chunk (rank order) against every gold evidence item
+    and compute the retrieval metrics of section 5 from the matches.
+
+    Returns:
+      per_chunk: [{rank, hit, matched_gold: [gold index...], coarse, overlap, reason, in_top_k}]
+      gold_first_rank: {gold index: first rank that matched it (any rank)}
+      hit_rate_at_k, recall_at_k, precision_at_k, mrr, ndcg_at_k, coarse_match, n_gold
+    """
+    per_chunk: List[Dict] = []
+    gold_first_rank: Dict[int, int] = {}
+    for i, chunk in enumerate(chunks):
+        rank = int(chunk.get("rank") or (i + 1))
+        matched: List[int] = []
+        coarse = False
+        best_overlap = 0.0
+        reasons: List[str] = []
+        for gi, gold in enumerate(gold_items):
+            m = match_chunk_to_evidence(chunk, gold, overlap_threshold)
+            if m["hit"]:
+                matched.append(gi)
+                coarse = coarse or m["coarse"]
+                best_overlap = max(best_overlap, m["overlap"])
+                reasons.append(f"gold {gi + 1}: {m['reason']}")
+                gold_first_rank.setdefault(gi, rank)
+            elif not reasons:
+                reasons.append(f"gold {gi + 1}: {m['reason']}")
+        per_chunk.append({
+            "rank": rank,
+            "hit": bool(matched),
+            "matched_gold": matched,
+            "coarse": coarse if matched else False,
+            "overlap": best_overlap,
+            "reason": "; ".join(reasons[:3]) if matched else (reasons[0] if reasons else "no gold evidence"),
+            "in_top_k": rank <= k,
+        })
+
+    n_gold = len(gold_items)
+    top = [c for c in per_chunk if c["in_top_k"]]
+    matched_in_top = {gi for c in top for gi in c["matched_gold"]}
+    hit_ranks = [c["rank"] for c in top if c["hit"]]
+
+    # nDCG with binary gains: a chunk gains 1 only when it is the first in rank
+    # order to cover some gold item, so several chunks covering the same passage
+    # (small-chunk strategies) do not inflate the score. Ideal: one chunk per
+    # gold item at the top.
+    credited: set = set()
+    dcg = 0.0
+    for c in sorted(top, key=lambda c: c["rank"]):
+        new = [gi for gi in c["matched_gold"] if gi not in credited]
+        if new:
+            dcg += 1.0 / math.log2(c["rank"] + 1)
+            credited.update(new)
+    ideal_n = min(n_gold, max(k, 0))
+    idcg = sum(1.0 / math.log2(r + 1) for r in range(1, ideal_n + 1))
+
+    return {
+        "per_chunk": per_chunk,
+        "gold_first_rank": gold_first_rank,
+        "n_gold": n_gold,
+        "hit_rate_at_k": 1.0 if hit_ranks else 0.0,
+        "recall_at_k": round(len(matched_in_top) / n_gold, 4) if n_gold else 0.0,
+        "precision_at_k": round(sum(1 for c in top if c["hit"]) / k, 4) if k else 0.0,
+        "mrr": round(1.0 / min(hit_ranks), 4) if hit_ranks else 0.0,
+        "ndcg_at_k": round(dcg / idcg, 4) if idcg else 0.0,
+        "coarse_match": any(c["coarse"] for c in top if c["hit"]),
+    }
+
+
+# ─────────────────────────────────────────────
+# Abstention (unanswerable cases)
+# ─────────────────────────────────────────────
+
+_ABSTAIN_PATTERNS = [
+    r"\bi\s+don'?t\s+know\b", r"\bdo(es)?\s+not\s+know\b", r"\bnot\s+(?:in|within)\s+the\s+(?:provided\s+)?(?:context|documents?|text|passages?)\b",
+    r"\b(?:context|documents?|text|passages?|information\s+provided)\s+(?:do(?:es)?\s+not|doesn'?t|don'?t)\s+(?:contain|include|mention|provide|specify|state|say)\b",
+    r"\bno\s+(?:information|mention|details?|answer)\b", r"\bcannot\s+(?:be\s+)?(?:answer|determine|find|locate)\w*\b",
+    r"\bcan'?t\s+(?:answer|determine|find)\b", r"\bunable\s+to\s+(?:answer|determine|find)\b",
+    r"\bnot\s+(?:mentioned|provided|specified|stated|available|found|present|addressed|covered)\b",
+    r"\binsufficient\s+(?:information|context)\b", r"\bis\s+not\s+(?:contained|included)\b",
+]
+_ABSTAIN_RE = re.compile("|".join(_ABSTAIN_PATTERNS), re.IGNORECASE)
+
+
+def is_abstention(answer: Optional[str]) -> bool:
+    """True when the generated answer says the documents do not contain the answer."""
+    text = (answer or "").strip()
+    if not text:
+        return True
+    head = text[:400]
+    return bool(_ABSTAIN_RE.search(head))
+
+
+def abstention_metrics(abstained_flags: List[Optional[bool]]) -> Dict:
+    """Correct-abstention and false-answer rates over unanswerable cases (None = not judged)."""
+    judged = [a for a in abstained_flags if a is not None]
+    n = len(judged)
+    if n == 0:
+        return {"n": 0, "correct_abstention_rate": None, "false_answer_rate": None}
+    correct = sum(1 for a in judged if a)
+    return {
+        "n": n,
+        "correct_abstention_rate": round(correct / n, 4),
+        "false_answer_rate": round((n - correct) / n, 4),
+    }
+
+
+# ─────────────────────────────────────────────
+# Bootstrap confidence intervals
+# ─────────────────────────────────────────────
+
+def bootstrap_ci(
+    values: List[Optional[float]],
+    n_boot: int = 1000,
+    confidence: float = 0.95,
+    seed: int = 0,
+    min_size: Optional[int] = None,
+) -> Dict:
+    """
+    Percentile bootstrap interval for the mean over test cases. Deterministic
+    for a given seed. Below `min_size` cases the interval is not reported and
+    enough_data is False ("not enough data" in the UI).
+    """
+    import random
+
+    if min_size is None:
+        try:
+            from config import MIN_CASES_FOR_CI as min_size
+        except Exception:
+            min_size = 10
+    clean = [float(v) for v in values if v is not None]
+    n = len(clean)
+    mean = round(sum(clean) / n, 4) if n else None
+    out = {"mean": mean, "low": None, "high": None, "n": n, "confidence": confidence, "enough_data": n >= min_size and n > 1}
+    if not out["enough_data"]:
+        return out
+    rng = random.Random(seed)
+    means = []
+    for _ in range(n_boot):
+        sample = [clean[rng.randrange(n)] for _ in range(n)]
+        means.append(sum(sample) / n)
+    means.sort()
+    alpha = (1.0 - confidence) / 2.0
+    lo_i = max(0, int(math.floor(alpha * n_boot)))
+    hi_i = min(n_boot - 1, int(math.ceil((1.0 - alpha) * n_boot)) - 1)
+    out["low"] = round(means[lo_i], 4)
+    out["high"] = round(means[hi_i], 4)
+    return out
+
+
+def format_ci(ci: Optional[Dict]) -> str:
+    """'0.750 [0.600, 0.900]' or '0.750 (not enough data)' or '—'."""
+    if not ci or ci.get("mean") is None:
+        return "—"
+    if not ci.get("enough_data"):
+        return f"{ci['mean']:.3f} (not enough data)"
+    return f"{ci['mean']:.3f} [{ci['low']:.3f}, {ci['high']:.3f}]"

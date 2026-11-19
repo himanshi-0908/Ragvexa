@@ -196,3 +196,18 @@ def get_user_chunk_ids(user_id: int) -> set[str]:
     vector_store = get_vector_store()
     res = vector_store.get(where=tenant_filter(user_id))
     return {m.get("chunk_id", "") for m in res.get("metadatas", []) if m}
+
+
+def get_user_indexed_document_ids(user_id: int) -> set[int]:
+    """document_ids that still have chunks in this user's index (evidence-based failure analysis)."""
+    vector_store = get_vector_store()
+    res = vector_store.get(where=tenant_filter(user_id), include=["metadatas"])
+    out: set[int] = set()
+    for m in (res or {}).get("metadatas", []) or []:
+        did = (m or {}).get("document_id")
+        if did is not None and not isinstance(did, bool):
+            try:
+                out.add(int(did))
+            except (TypeError, ValueError):
+                pass
+    return out

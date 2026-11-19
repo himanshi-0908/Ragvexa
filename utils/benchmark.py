@@ -27,7 +27,15 @@ from typing import Any, Callable, Dict, List, Optional
 
 from retriver.retriver import retrieve_pipeline, PIPELINE_NAMES
 from utils.eval_dataset import load_eval_queries, dataset_fingerprint
-from utils.evaluator import evaluate_query
+from utils.evaluator import (
+    DEFAULT_OVERLAP_THRESHOLD,
+    abstention_metrics,
+    bootstrap_ci,
+    evaluate_query,
+    format_ci,
+    is_abstention,
+    match_retrieved_chunks,
+)
 
 logger = logging.getLogger("ragvexa")
 
@@ -35,7 +43,7 @@ FAILURE_CATEGORIES = ("ok", "missing_evidence", "retrieval", "ranking", "generat
 GENERATION_FAIL_THRESHOLD = 0.5
 
 _METRIC_KEYS = [
-    "recall_at_k", "precision_at_k", "mrr", "ndcg_at_k",
+    "hit_rate_at_k", "recall_at_k", "precision_at_k", "mrr", "ndcg_at_k",
     "retrieval_latency_ms", "reranking_latency_ms",
     "context_relevance", "answer_faithfulness", "answer_groundedness",
     "answer_relevance", "answer_correctness",
@@ -166,9 +174,17 @@ def run_benchmark(
     api_key: Optional[str] = None,
     answer_model: Optional[str] = None,
     judge_model: Optional[str] = None,
+    test_set_id: Optional[int] = None,
+    overlap_threshold: Optional[float] = None,
 ) -> BenchmarkReport:
     """
     Run the benchmark for the given user.
+
+    With `test_set_id` the run uses one of the user's own test sets instead of
+    the eval queries: the set is snapshotted first (immutable JSON stored in
+    the run config), every strategy evaluates exactly that snapshot, and
+    retrieval metrics come from evidence matching (same document, page
+    overlap, passage token overlap >= `overlap_threshold`), never chunk ids.
 
     Args:
         user_id: authenticated user's DB ID (all data access is scoped to it)
@@ -184,6 +200,8 @@ def run_benchmark(
                            defaults to Naive retrieval at 4*k
         api_key: the user's own NVIDIA key; None means the server (demo) key
         answer_model / judge_model: override the configured model ids
+        test_set_id: run on this user test set (snapshotted) instead of eval queries
+        overlap_threshold: passage token-overlap needed for an evidence hit (default 0.5)
     """
     from utils.documents import check_daily_quota, record_usage
 
@@ -193,17 +211,42 @@ def run_benchmark(
     if unknown:
         raise ValueError(f"Unknown pipelines: {unknown}")
 
-    queries = load_eval_queries(user_id, reviewed_only=reviewed_only)
-    if not queries:
-        return BenchmarkReport(
-            pipelines=pipelines, k=k, per_pipeline={}, per_query=[],
-            total_queries=0, total_duration_ms=0,
-            config={"reviewed_only": reviewed_only, "reason": "no eval queries"},
-        )
+    snapshot = None
+    queries: List[Dict] = []
+    if test_set_id is not None:
+        from utils.test_sets import test_set_snapshot
+        snapshot = test_set_snapshot(user_id, int(test_set_id))
+        if snapshot is None:
+            raise ValueError("Test set not found")
+        if not snapshot["cases"]:
+            return BenchmarkReport(
+                pipelines=pipelines, k=k, per_pipeline={}, per_query=[],
+                total_queries=0, total_duration_ms=0,
+                config={"dataset_kind": "test_set", "test_set_id": test_set_id, "reason": "test set is empty"},
+            )
+        if overlap_threshold is None:
+            try:
+                from config import EVIDENCE_OVERLAP_THRESHOLD as overlap_threshold
+            except Exception:
+                overlap_threshold = DEFAULT_OVERLAP_THRESHOLD
+        overlap_threshold = float(overlap_threshold)
+        if not (0.0 < overlap_threshold <= 1.0):
+            raise ValueError("overlap_threshold must be in (0, 1]")
+        fingerprint = snapshot["fingerprint"]
+        cache_extra = f"{include_llm_judges}-ts{test_set_id}-{overlap_threshold}"
+    else:
+        queries = load_eval_queries(user_id, reviewed_only=reviewed_only)
+        if not queries:
+            return BenchmarkReport(
+                pipelines=pipelines, k=k, per_pipeline={}, per_query=[],
+                total_queries=0, total_duration_ms=0,
+                config={"reviewed_only": reviewed_only, "reason": "no eval queries"},
+            )
+        fingerprint = dataset_fingerprint(queries)
+        cache_extra = f"{include_llm_judges}-{reviewed_only}"
 
-    fingerprint = dataset_fingerprint(queries)
     cache = _session_cache()
-    cache_key = _cache_key(user_id, k, pipelines, fingerprint, f"{include_llm_judges}-{reviewed_only}")
+    cache_key = _cache_key(user_id, k, pipelines, fingerprint, cache_extra)
     if not force_rerun and cache_key in cache:
         return cache[cache_key]
 
@@ -222,11 +265,12 @@ def run_benchmark(
         llm = get_llm(answer_model, api_key=api_key)
         judge_llm = get_judge_llm(api_key=api_key, model=judge_model)
 
-    try:
-        indexed_ids = get_user_chunk_ids(user_id)
-    except Exception as e:
-        logger.warning("Could not load indexed chunk ids for failure analysis: %s", e)
-        indexed_ids = None
+    indexed_ids = None
+    if snapshot is None:  # chunk-id failure analysis applies to eval queries only
+        try:
+            indexed_ids = get_user_chunk_ids(user_id)
+        except Exception as e:
+            logger.warning("Could not load indexed chunk ids for failure analysis: %s", e)
 
     if candidate_pool_fn is None:
         def candidate_pool_fn(q: str) -> List[str]:
@@ -264,8 +308,34 @@ def run_benchmark(
     accum: Dict[str, Dict[str, list]] = {p: {key: [] for key in _METRIC_KEYS} for p in pipelines}
     failures: Dict[str, Dict[str, int]] = {p: {c: 0 for c in FAILURE_CATEGORIES} for p in pipelines}
     per_query_rows: List[Dict] = []
+    extra_per_pipeline: Dict[str, Dict] = {}
 
-    for q_info in queries:
+    if snapshot is not None:
+        from config import MIN_CASES_FOR_CI
+        cases = snapshot["cases"]
+        config.update({
+            "dataset_kind": "test_set",
+            "test_set_id": snapshot["test_set_id"],
+            "test_set_name": snapshot["name"],
+            "test_set_fingerprint": snapshot["fingerprint"],
+            # Immutable copy of the cases every strategy was evaluated on.
+            "test_set_snapshot": json.loads(json.dumps(snapshot, default=str)),
+            "overlap_threshold": overlap_threshold,
+            "min_cases_for_ci": MIN_CASES_FOR_CI,
+            "dataset_size": len(cases),
+            "dataset_human_queries": len(cases),
+            "dataset_reviewed_queries": len(cases),
+            "dataset_answerable": sum(1 for c in cases if c.get("answerable")),
+            "dataset_unanswerable": sum(1 for c in cases if not c.get("answerable")),
+        })
+        total_steps = len(cases) * len(pipelines)
+        per_query_rows, failures, extra_per_pipeline = _run_on_test_set(
+            user_id, cases, pipelines, k, overlap_threshold, llm, judge_llm,
+            include_llm_judges, progress_callback, accum, total_steps,
+        )
+        queries = cases  # for total_queries below
+
+    for q_info in ([] if snapshot is not None else queries):
         query = q_info["query"]
         relevant_ids = q_info["relevant_chunk_ids"]
         candidate_ids: Optional[List[str]] = None  # computed lazily, once per query
@@ -330,6 +400,7 @@ def run_benchmark(
         agg["cost_usd"] = _sum(amap["cost_usd"]) if (n_judged and len(amap["cost_usd"]) == n_judged) else None
         agg["failures"] = failures[p]
         agg["pipeline"] = p
+        agg.update(extra_per_pipeline.get(p, {}))
         per_pipeline[p] = agg
 
     total_duration_ms = int((time.time() - global_t0) * 1000)
@@ -372,6 +443,242 @@ def run_benchmark(
 
     cache[cache_key] = report
     return report
+
+
+# ─────────────────────────────────────────────
+# Evidence-based evaluation on a user test set
+# ─────────────────────────────────────────────
+
+_CI_METRICS = ("hit_rate_at_k", "recall_at_k", "mrr", "ndcg_at_k",
+               "answer_faithfulness", "answer_groundedness", "answer_correctness", "answer_relevance")
+
+
+def _chunk_dict(c, snippet_chars: int = 300) -> Dict:
+    """RetrievedChunk -> plain dict with origin fields (what the matcher and UI consume)."""
+    return {
+        "chunk_id": c.chunk_id,
+        "source": c.source,
+        "document_id": getattr(c, "document_id", None),
+        "page_start": getattr(c, "page_start", None),
+        "page_end": getattr(c, "page_end", None),
+        "char_start": getattr(c, "char_start", None),
+        "char_end": getattr(c, "char_end", None),
+        "text": c.text,
+        "snippet": c.text[:snippet_chars],
+        "score": c.score,
+        "rank": c.rank,
+    }
+
+
+def classify_evidence_failure(
+    answerable: bool,
+    hit_in_top_k: bool,
+    evidence_indexed: bool,
+    hit_in_candidates: Optional[bool],
+    metrics: Optional[Dict] = None,
+    abstained: Optional[bool] = None,
+) -> str:
+    """
+    Failure stage for one test case x strategy, from evidence matching.
+
+    Unanswerable case: ok when the system abstained (or was not judged),
+                       generation when it answered anyway.
+    missing_evidence : no gold document has chunks in the index any more
+    retrieval        : gold evidence indexed but not in the wider candidate pool
+    ranking          : in the candidate pool but outside top-k
+    generation       : evidence retrieved but the judged answer is poor
+    ok               : evidence retrieved and (if judged) the answer is acceptable
+    """
+    if not answerable:
+        return "generation" if abstained is False else "ok"
+    if not evidence_indexed:
+        return "missing_evidence"
+    if hit_in_top_k:
+        if metrics:
+            scores = [metrics.get("answer_faithfulness"), metrics.get("answer_groundedness"), metrics.get("answer_correctness")]
+            judged = [s for s in scores if s is not None]
+            if judged and min(judged) < GENERATION_FAIL_THRESHOLD:
+                return "generation"
+        return "ok"
+    if hit_in_candidates:
+        return "ranking"
+    return "retrieval"
+
+
+def _run_on_test_set(
+    user_id: int,
+    cases: List[Dict],
+    pipelines: List[str],
+    k: int,
+    overlap_threshold: float,
+    llm,
+    judge_llm,
+    include_llm_judges: bool,
+    progress_callback,
+    accum: Dict[str, Dict[str, list]],
+    total_steps: int,
+):
+    """
+    Evaluate every strategy on the same immutable list of cases. Retrieval
+    metrics are computed by matching retrieved chunks to gold evidence; the
+    per-case rows carry everything the evidence view needs.
+    """
+    from retriver.vector_store import get_user_indexed_document_ids
+
+    try:
+        indexed_docs: Optional[set] = get_user_indexed_document_ids(user_id)
+    except Exception as e:
+        logger.warning("Could not load indexed document ids for failure analysis: %s", e)
+        indexed_docs = None
+
+    def candidate_chunks(q: str) -> List[Dict]:
+        try:
+            wide = retrieve_pipeline(q, user_id, strategy="Naive", k=max(4 * k, 20))
+            return [_chunk_dict(c) for c in wide.chunks]
+        except Exception:
+            return []
+
+    failures: Dict[str, Dict[str, int]] = {p: {c: 0 for c in FAILURE_CATEGORIES} for p in pipelines}
+    rows: List[Dict] = []
+    abstain: Dict[str, List[Optional[bool]]] = {p: [] for p in pipelines}
+    coarse_counts: Dict[str, int] = {p: 0 for p in pipelines}
+    by_tag: Dict[str, Dict[str, Dict[str, list]]] = {p: defaultdict(lambda: defaultdict(list)) for p in pipelines}
+    step = 0
+
+    for case in cases:
+        question = case["question"]
+        gold = list(case.get("gold_evidence") or [])
+        answerable = bool(case.get("answerable"))
+        tags = list(case.get("tags") or [])
+        candidates: Optional[List[Dict]] = None  # computed lazily, once per case
+        evidence_indexed = True
+        if answerable and indexed_docs is not None:
+            evidence_indexed = any(
+                (g.get("document_id") is not None and int(g["document_id"]) in indexed_docs) for g in gold
+            )
+
+        for pipeline_name in pipelines:
+            step += 1
+            if progress_callback:
+                progress_callback(step, total_steps, f"{pipeline_name}: {question[:50]}…")
+
+            pipeline_result = retrieve_pipeline(question, user_id, strategy=pipeline_name, k=k)
+            chunks = [_chunk_dict(c) for c in pipeline_result.chunks]
+
+            metrics = evaluate_query(
+                query=question,
+                pipeline_result=pipeline_result,
+                relevant_chunk_ids=[],
+                k=k,
+                llm=llm,
+                include_llm_judges=include_llm_judges,
+                judge_llm=judge_llm,
+                reference_answer=case.get("expected_answer"),
+            )
+
+            abstained: Optional[bool] = None
+            if metrics.get("answer") is not None:
+                abstained = is_abstention(metrics["answer"])
+
+            if answerable:
+                match = match_retrieved_chunks(chunks, gold, k, overlap_threshold)
+                hit_top = match["hit_rate_at_k"] > 0
+                hit_cand: Optional[bool] = None
+                if not hit_top and evidence_indexed:
+                    if candidates is None:
+                        candidates = candidate_chunks(question)
+                    hit_cand = match_retrieved_chunks(candidates, gold, len(candidates) or 1, overlap_threshold)["hit_rate_at_k"] > 0
+                for key in ("hit_rate_at_k", "recall_at_k", "precision_at_k", "mrr", "ndcg_at_k"):
+                    metrics[key] = match[key]
+                metrics["coarse_match"] = match["coarse_match"]
+                metrics["n_gold"] = match["n_gold"]
+                metrics["gold_first_rank"] = {str(gi): r for gi, r in match["gold_first_rank"].items()}
+                per_chunk = match["per_chunk"]
+                if match["coarse_match"]:
+                    coarse_counts[pipeline_name] += 1
+            else:
+                # Unanswerable: excluded from retrieval metrics (None is skipped by _avg).
+                for key in ("hit_rate_at_k", "recall_at_k", "precision_at_k", "mrr", "ndcg_at_k"):
+                    metrics[key] = None
+                metrics["coarse_match"] = False
+                metrics["n_gold"] = 0
+                metrics["gold_first_rank"] = {}
+                hit_top, hit_cand = False, None
+                per_chunk = [{"rank": c["rank"], "hit": False, "matched_gold": [], "coarse": False,
+                              "overlap": 0.0, "reason": "unanswerable case", "in_top_k": True} for c in chunks]
+                abstain[pipeline_name].append(abstained)
+
+            category = classify_evidence_failure(answerable, hit_top, evidence_indexed, hit_cand, metrics, abstained)
+            failures[pipeline_name][category] += 1
+
+            metrics.update({
+                "query": question,
+                "case_id": case.get("case_id"),
+                "answerable": answerable,
+                "tags": tags,
+                "expected_answer": case.get("expected_answer"),
+                "reference_answer": case.get("expected_answer"),
+                "gold_evidence": gold,
+                "origin": "human",
+                "reviewed": True,
+                "relevant_chunk_ids": [],
+                "abstained": abstained,
+                "abstention_correct": (abstained if not answerable else None) if abstained is not None else None,
+                "evidence_indexed": evidence_indexed,
+                "failure_category": category,
+                "retrieved_chunks": [
+                    {
+                        "chunk_id": c["chunk_id"],
+                        "source": c["source"],
+                        "document_id": c["document_id"],
+                        "page_start": c["page_start"],
+                        "page_end": c["page_end"],
+                        "char_start": c["char_start"],
+                        "char_end": c["char_end"],
+                        "text": c["snippet"],
+                        "score": c["score"],
+                        "rank": c["rank"],
+                        "relevant": m["hit"],
+                        "hit": m["hit"],
+                        "matched_gold": m["matched_gold"],
+                        "matched_gold_label": ", ".join(f"gold {gi + 1}" for gi in m["matched_gold"]) or None,
+                        "coarse": m["coarse"],
+                        "overlap": m["overlap"],
+                        "reason": m["reason"],
+                    }
+                    for c, m in zip(chunks, per_chunk)
+                ],
+            })
+            rows.append(metrics)
+
+            amap = accum[pipeline_name]
+            for key in amap:
+                val = metrics.get(key)
+                if val is not None:
+                    amap[key].append(val)
+            if answerable:
+                for tag in tags:
+                    for key in ("hit_rate_at_k", "recall_at_k", "mrr", "ndcg_at_k"):
+                        by_tag[pipeline_name][tag][key].append(metrics[key])
+
+    extra: Dict[str, Dict] = {}
+    n_answerable = sum(1 for c in cases if c.get("answerable"))
+    n_unanswerable = len(cases) - n_answerable
+    for p in pipelines:
+        amap = accum[p]
+        extra[p] = {
+            "n_cases": len(cases),
+            "n_answerable": n_answerable,
+            "n_unanswerable": n_unanswerable,
+            "ci": {m: bootstrap_ci(amap[m]) for m in _CI_METRICS if amap.get(m)},
+            "abstention": abstention_metrics(abstain[p]),
+            "coarse_matches": coarse_counts[p],
+            "by_tag": {
+                tag: {"n": len(vals["recall_at_k"]), **{m: _avg(vals[m]) for m in ("hit_rate_at_k", "recall_at_k", "mrr", "ndcg_at_k")}}
+                for tag, vals in sorted(by_tag[p].items())
+            },
+        }
+    return rows, failures, extra
 
 
 # ─────────────────────────────────────────────
@@ -427,6 +734,7 @@ def list_runs(user_id: int, limit: int = 20) -> List[Dict]:
                 "reviewed_only": cfg.get("reviewed_only"),
                 "dataset_fingerprint": cfg.get("dataset_fingerprint"),
                 "dataset_size": cfg.get("dataset_size"),
+                "dataset": f"test set: {cfg.get('test_set_name')}" if cfg.get("dataset_kind") == "test_set" else "eval queries",
             })
         return out
     finally:
@@ -482,6 +790,116 @@ def get_pipeline_summary_table(report: BenchmarkReport) -> List[Dict]:
     return rows
 
 
+def is_test_set_report(report: BenchmarkReport) -> bool:
+    return (report.config or {}).get("dataset_kind") == "test_set"
+
+
+def get_test_set_summary_table(report: BenchmarkReport) -> List[Dict]:
+    """Strategies x metrics with bootstrap intervals, abstention rates and failure counts."""
+    rows = []
+    for p in report.pipelines:
+        m = report.per_pipeline.get(p, {})
+        ci = m.get("ci") or {}
+        ab = m.get("abstention") or {}
+
+        def pct(v):
+            return f"{v:.1%}" if v is not None else "—"
+
+        rows.append({
+            "Pipeline": p,
+            f"Hit rate@{report.k}": format_ci(ci.get("hit_rate_at_k")),
+            f"Recall@{report.k}": format_ci(ci.get("recall_at_k")),
+            "MRR": format_ci(ci.get("mrr")),
+            f"nDCG@{report.k}": format_ci(ci.get("ndcg_at_k")),
+            "Correct abstention": pct(ab.get("correct_abstention_rate")),
+            "False answer": pct(ab.get("false_answer_rate")),
+            "Faithfulness": format_ci(ci.get("answer_faithfulness")),
+            "Correctness": format_ci(ci.get("answer_correctness")),
+            "Coarse matches": int(m.get("coarse_matches") or 0),
+            "Retr. ms": int(m.get("retrieval_latency_ms") or 0),
+            "Answerable / Unanswerable": f"{m.get('n_answerable', 0)} / {m.get('n_unanswerable', 0)}",
+        })
+    return rows
+
+
+def get_tag_breakdown_table(report: BenchmarkReport) -> List[Dict]:
+    """One row per (tag, pipeline) with the retrieval metrics over answerable cases with that tag."""
+    rows = []
+    for p in report.pipelines:
+        for tag, vals in (report.per_pipeline.get(p, {}).get("by_tag") or {}).items():
+            rows.append({
+                "Tag": tag,
+                "Pipeline": p,
+                "Cases": vals.get("n", 0),
+                f"Hit rate@{report.k}": vals.get("hit_rate_at_k"),
+                f"Recall@{report.k}": vals.get("recall_at_k"),
+                "MRR": vals.get("mrr"),
+                f"nDCG@{report.k}": vals.get("ndcg_at_k"),
+            })
+    rows.sort(key=lambda r: (r["Tag"], r["Pipeline"]))
+    return rows
+
+
+def get_evidence_rows(
+    report: BenchmarkReport,
+    failed_only: bool = False,
+    tag: Optional[str] = None,
+    pipeline: Optional[str] = None,
+) -> List[Dict]:
+    """Per-case x strategy rows for the evidence view, optionally filtered."""
+    out = []
+    for row in report.per_query:
+        if pipeline and row.get("pipeline") != pipeline:
+            continue
+        if tag and tag not in (row.get("tags") or []):
+            continue
+        if failed_only and row.get("failure_category", "ok") == "ok":
+            continue
+        out.append(row)
+    return out
+
+
+def get_evidence_view(report: BenchmarkReport, case_id) -> Dict:
+    """
+    Everything the UI shows for one test case: the case itself and, per
+    strategy, retrieved chunks with hit/miss marks, the matched gold item,
+    answer, judge scores and failure label.
+    """
+    rows = [r for r in report.per_query if r.get("case_id") == case_id]
+    if not rows:
+        return {}
+    first = rows[0]
+    return {
+        "case_id": case_id,
+        "question": first.get("query"),
+        "expected_answer": first.get("expected_answer"),
+        "answerable": first.get("answerable"),
+        "tags": first.get("tags") or [],
+        "gold_evidence": first.get("gold_evidence") or [],
+        "per_pipeline": [
+            {
+                "pipeline": r.get("pipeline"),
+                "hit_rate_at_k": r.get("hit_rate_at_k"),
+                "recall_at_k": r.get("recall_at_k"),
+                "mrr": r.get("mrr"),
+                "ndcg_at_k": r.get("ndcg_at_k"),
+                "coarse_match": r.get("coarse_match"),
+                "failure_category": r.get("failure_category"),
+                "abstained": r.get("abstained"),
+                "answer": r.get("answer"),
+                "answer_faithfulness": r.get("answer_faithfulness"),
+                "answer_groundedness": r.get("answer_groundedness"),
+                "answer_correctness": r.get("answer_correctness"),
+                "answer_relevance": r.get("answer_relevance"),
+                "rewritten_query": r.get("rewritten_query"),
+                "error": r.get("error"),
+                "retrieved_chunks": r.get("retrieved_chunks") or [],
+            }
+            for r in rows
+        ],
+    }
+
+
 def get_failure_analysis(report: BenchmarkReport) -> List[Dict]:
     """Return queries where ALL pipelines achieved Recall@K = 0."""
     recall_by_query: Dict[str, List[float]] = defaultdict(list)
@@ -508,6 +926,26 @@ def get_limitations(report: BenchmarkReport) -> List[str]:
     """Plain-language caveats that must accompany any numbers from this report."""
     cfg = report.config or {}
     notes = []
+    if cfg.get("dataset_kind") == "test_set":
+        size = cfg.get("dataset_size", report.total_queries) or 0
+        min_ci = cfg.get("min_cases_for_ci") or 0
+        if size < min_ci:
+            notes.append(f"Only {size} test cases: below the {min_ci} needed for a bootstrap confidence interval, "
+                         "so no interval (and no verdict) is reported.")
+        coarse = sum(int((report.per_pipeline.get(p, {}) or {}).get("coarse_matches") or 0) for p in report.pipelines)
+        if coarse:
+            notes.append(f"{coarse} case×strategy hits are coarse matches (gold item without a passage: matched on "
+                         "document/page only). Add passages to those cases for precise matching.")
+        if not cfg.get("include_llm_judges"):
+            notes.append("No answers were generated, so abstention and answer-quality metrics are not available.")
+        if cfg.get("include_llm_judges"):
+            if cfg.get("judge_independent") is False:
+                notes.append("The judge model is the same as the generator; judge scores may be biased.")
+            notes.append("Judge scores are LLM opinions on a 0–1 scale and are not a substitute for human review.")
+        for role, sw in (cfg.get("model_switches") or {}).items():
+            notes.append(f"The {role} model '{sw['from']}' was not usable with the active API key; "
+                         f"'{sw['to']}' was used instead.")
+        return notes
     human = cfg.get("dataset_human_queries", 0) or 0
     reviewed = cfg.get("dataset_reviewed_queries", 0) or 0
     size = cfg.get("dataset_size", report.total_queries) or 0
